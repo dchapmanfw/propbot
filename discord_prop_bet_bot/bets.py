@@ -171,6 +171,8 @@ class BetService:
             raise ValueError("This bet is no longer open.")
         if datetime.now(timezone.utc) >= bet.close_time:
             raise ValueError("This bet has already closed.")
+        if user_id == bet.creator_id:
+            raise ValueError("You cannot wager on a bet you created.")
 
         await self.db.ensure_user(guild_id, user_id)
         existing = await self.db.get_wager(bet_id, user_id)
@@ -259,8 +261,11 @@ class BetService:
         assert updated is not None
         return updated, payouts
 
-    async def refund_unresolved_bet(self, bet_id: int) -> Bet | None:
-        """Refund all wagers when a closed bet expires without resolution."""
+    async def refund_unresolved_bet(self, bet_id: int) -> tuple[Bet, int] | None:
+        """
+        Refund all wagers when a closed bet was never resolved.
+        Returns (updated_bet, refunded_wager_count) or None if not applicable.
+        """
         bet = await self.db.get_bet(bet_id)
         if not bet or bet.status != BetStatus.CLOSED:
             return None
@@ -270,4 +275,7 @@ class BetService:
             await self.db.adjust_balance(bet.guild_id, wager.user_id, wager.amount)
             await self.db.remove_wager(bet_id, wager.user_id)
 
-        return await self.db.update_bet_status(bet_id, BetStatus.CANCELLED)
+        updated = await self.db.update_bet_status(bet_id, BetStatus.CANCELLED)
+        if not updated:
+            return None
+        return updated, len(wagers)

@@ -60,6 +60,19 @@ async def test_insufficient_funds_rejected(service):
 
 
 @pytest.mark.asyncio
+async def test_creator_cannot_wager_on_own_bet(service):
+    svc, db = service
+    bet_id = await _open_bet(db)
+    await db.ensure_user(1, 99)
+
+    with pytest.raises(ValueError, match="cannot wager on a bet you created"):
+        await svc.place_or_update_wager(1, bet_id, 99, WagerPick.YES, 100)
+
+    assert await db.get_balance(1, 99) == STARTING_BALANCE
+    assert await db.get_wager(bet_id, 99) is None
+
+
+@pytest.mark.asyncio
 async def test_update_wager_adjusts_balance(service):
     svc, db = service
     bet_id = await _open_bet(db)
@@ -142,3 +155,64 @@ async def test_close_bet_changes_status(service):
     closed = await svc.close_bet(bet_id)
     assert closed is not None
     assert closed.status == BetStatus.CLOSED
+
+
+@pytest.mark.asyncio
+async def test_refund_unresolved_bet_returns_wagers(service):
+    svc, db = service
+    bet_id = await _open_bet(db)
+    await db.ensure_user(1, 50)
+    await db.ensure_user(1, 51)
+
+    await svc.place_or_update_wager(1, bet_id, 50, WagerPick.YES, 100)
+    await svc.place_or_update_wager(1, bet_id, 51, WagerPick.NO, 200)
+    await svc.close_bet(bet_id)
+
+    result = await svc.refund_unresolved_bet(bet_id)
+    assert result is not None
+    bet, count = result
+    assert bet.status == BetStatus.CANCELLED
+    assert count == 2
+    assert await db.get_balance(1, 50) == STARTING_BALANCE
+    assert await db.get_balance(1, 51) == STARTING_BALANCE
+    assert await db.get_wagers_for_bet(bet_id) == []
+
+
+@pytest.mark.asyncio
+async def test_refund_unresolved_bet_ignores_open_bets(service):
+    svc, db = service
+    bet_id = await _open_bet(db)
+    assert await svc.refund_unresolved_bet(bet_id) is None
+
+
+@pytest.mark.asyncio
+async def test_get_stale_closed_bets(service):
+    svc, db = service
+    past = datetime.now(timezone.utc) - timedelta(hours=48)
+    bet = await db.create_bet(
+        guild_id=1,
+        channel_id=100,
+        creator_id=99,
+        question="Old closed bet?",
+        close_time=past,
+        yes_odds=2.0,
+        no_odds=1.5,
+    )
+    await db.update_bet_status(bet.id, BetStatus.CLOSED)
+
+    recent = datetime.now(timezone.utc) - timedelta(hours=1)
+    recent_bet = await db.create_bet(
+        guild_id=1,
+        channel_id=100,
+        creator_id=99,
+        question="Recently closed bet?",
+        close_time=recent,
+        yes_odds=2.0,
+        no_odds=1.5,
+    )
+    await db.update_bet_status(recent_bet.id, BetStatus.CLOSED)
+
+    stale = await db.get_stale_closed_bets(timedelta(hours=24))
+    stale_ids = {b.id for b in stale}
+    assert bet.id in stale_ids
+    assert recent_bet.id not in stale_ids

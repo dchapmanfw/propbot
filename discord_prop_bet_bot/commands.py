@@ -441,6 +441,21 @@ class PropBetCommands(commands.Cog):
             await self.bot.refresh_bet_message(bet.id)
             return
 
+        if payload.user_id == bet.creator_id:
+            user = self.bot.get_user(payload.user_id) or await self.bot.fetch_user(
+                payload.user_id
+            )
+            try:
+                await user.send("You cannot wager on a bet you created.")
+            except discord.Forbidden:
+                channel = self.bot.get_channel(payload.channel_id)
+                if channel:
+                    await channel.send(
+                        f"{user.mention} You cannot wager on a bet you created.",
+                        delete_after=15,
+                    )
+            return
+
         user = self.bot.get_user(payload.user_id) or await self.bot.fetch_user(
             payload.user_id
         )

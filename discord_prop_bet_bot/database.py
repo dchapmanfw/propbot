@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import aiosqlite
@@ -233,6 +233,25 @@ class Database:
             ORDER BY close_time ASC
             """,
             (BetStatus.OPEN.value, now.isoformat()),
+        )
+        rows = await cursor.fetchall()
+        return [_row_to_bet(row) for row in rows]
+
+    async def get_stale_closed_bets(
+        self,
+        refund_after: timedelta,
+        now: datetime | None = None,
+    ) -> list[Bet]:
+        """Closed bets past close_time + refund_after that still await resolution."""
+        now = now or datetime.now(timezone.utc)
+        refund_cutoff = now - refund_after
+        cursor = await self.conn.execute(
+            """
+            SELECT * FROM bets
+            WHERE status = ? AND close_time <= ?
+            ORDER BY close_time ASC
+            """,
+            (BetStatus.CLOSED.value, refund_cutoff.isoformat()),
         )
         rows = await cursor.fetchall()
         return [_row_to_bet(row) for row in rows]
