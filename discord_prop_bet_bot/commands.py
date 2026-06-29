@@ -1,0 +1,497 @@
+"""Slash commands, modals, and reaction handlers for the prop bet bot."""
+
+from __future__ import annotations
+
+import logging
+from datetime import datetime, timezone
+from typing import TYPE_CHECKING
+
+import discord
+from discord import app_commands
+from discord.ext import commands
+
+from bets import (
+    BetService,
+    DurationParseError,
+    build_bet_embed,
+    emoji_from_pick,
+    parse_duration,
+    pick_from_emoji,
+)
+from config import NO_EMOJI, YES_EMOJI
+from database import Database
+from models import BetOutcome, BetStatus, WagerPick
+
+if TYPE_CHECKING:
+    from bot import PropBetBot
+
+logger = logging.getLogger(__name__)
+
+
+class WagerModal(discord.ui.Modal, title="Enter your wager"):
+    """Modal prompting the user for a wager amount after reacting to a bet."""
+
+    amount_input = discord.ui.TextInput(
+        label="Wager amount",
+        placeholder="Enter a positive whole number",
+        min_length=1,
+        max_length=10,
+    )
+
+    def __init__(
+        self,
+        bot: PropBetBot,
+        bet_id: int,
+        pick: WagerPick,
+        guild_id: int,
+    ) -> None:
+        super().__init__()
+        self.bot = bot
+        self.bet_id = bet_id
+        self.pick = pick
+        self.guild_id = guild_id
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        try:
+            amount = int(self.amount_input.value.strip())
+        except ValueError:
+            await interaction.response.send_message(
+                "Please enter a valid positive integer.", ephemeral=True
+            )
+            return
+
+        service = BetService(self.bot.db)
+        try:
+            wager, balance = await service.place_or_update_wager(
+                self.guild_id,
+                self.bet_id,
+                interaction.user.id,
+                self.pick,
+                amount,
+            )
+        except ValueError as exc:
+            await interaction.response.send_message(str(exc), ephemeral=True)
+            return
+
+        await interaction.response.send_message(
+            f"You wagered **{wager.amount}** on **{self.pick.value.upper()}** "
+            f"for bet #{self.bet_id}. Remaining balance: **{balance}**.",
+            ephemeral=True,
+        )
+
+        await self.bot.refresh_bet_message(self.bet_id)
+
+
+class WagerButtonView(discord.ui.View):
+    """Button that opens the wager modal (used after reaction or in DMs)."""
+
+    def __init__(
+        self,
+        bot: PropBetBot,
+        bet_id: int,
+        pick: WagerPick,
+        guild_id: int,
+        owner_id: int,
+    ) -> None:
+        super().__init__(timeout=300)
+        self.bot = bot
+        self.bet_id = bet_id
+        self.pick = pick
+        self.guild_id = guild_id
+        self.owner_id = owner_id
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message(
+                "This button is not for you.", ephemeral=True
+            )
+            return False
+        return True
+
+    @discord.ui.button(label="Enter wager", style=discord.ButtonStyle.primary)
+    async def enter_wager(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        await interaction.response.send_modal(
+            WagerModal(self.bot, self.bet_id, self.pick, self.guild_id)
+        )
+
+
+class PropBetCommands(commands.Cog):
+    """Slash commands and event handlers for prop bets."""
+
+    def __init__(self, bot: PropBetBot) -> None:
+        self.bot = bot
+        self.db: Database = bot.db
+
+    async def _is_admin_or_creator(
+        self, interaction: discord.Interaction, bet_creator_id: int
+    ) -> bool:
+        if interaction.user.id == bet_creator_id:
+            return True
+        if not interaction.guild:
+            return False
+        perms = interaction.user.guild_permissions
+        return bool(perms.administrator or perms.manage_guild)
+
+    @app_commands.command(name="balance", description="Show your current balance")
+    async def balance(self, interaction: discord.Interaction) -> None:
+        if not interaction.guild:
+            await interaction.response.send_message(
+                "This command can only be used in a server.", ephemeral=True
+            )
+            return
+
+        user = await self.db.ensure_user(interaction.guild.id, interaction.user.id)
+        await interaction.response.send_message(
+            f"Your balance: **{user.balance}** coins.", ephemeral=True
+        )
+
+    @app_commands.command(
+        name="bet_create",
+        description="Create a new yes/no prop bet",
+    )
+    @app_commands.describe(
+        question="The yes/no question to bet on",
+        duration="How long betting stays open (e.g. 2h, 30m, 1d)",
+        yes_odds="Payout multiplier for YES winners",
+        no_odds="Payout multiplier for NO winners",
+    )
+    async def bet_create(
+        self,
+        interaction: discord.Interaction,
+        question: str,
+        duration: str,
+        yes_odds: float,
+        no_odds: float,
+    ) -> None:
+        if not interaction.guild or not interaction.channel:
+            await interaction.response.send_message(
+                "This command can only be used in a server channel.", ephemeral=True
+            )
+            return
+
+        if yes_odds <= 0 or no_odds <= 0:
+            await interaction.response.send_message(
+                "Odds must be positive numbers.", ephemeral=True
+            )
+            return
+
+        try:
+            delta = parse_duration(duration)
+        except DurationParseError as exc:
+            await interaction.response.send_message(str(exc), ephemeral=True)
+            return
+
+        close_time = datetime.now(timezone.utc) + delta
+        await self.db.ensure_user(interaction.guild.id, interaction.user.id)
+
+        bet = await self.db.create_bet(
+            guild_id=interaction.guild.id,
+            channel_id=interaction.channel.id,
+            creator_id=interaction.user.id,
+            question=question,
+            close_time=close_time,
+            yes_odds=yes_odds,
+            no_odds=no_odds,
+        )
+
+        embed = build_bet_embed(bet, creator=interaction.user)
+        await interaction.response.send_message(embed=embed)
+        message = await interaction.original_response()
+
+        await self.db.set_bet_message_id(bet.id, message.id)
+        await message.add_reaction(YES_EMOJI)
+        await message.add_reaction(NO_EMOJI)
+
+        bet = await self.db.get_bet(bet.id)
+        assert bet is not None
+        self.bot.track_open_bet(bet)
+
+    @app_commands.command(name="bet_resolve", description="Resolve a bet with an outcome")
+    @app_commands.describe(
+        bet_id="The bet ID to resolve",
+        outcome="Final outcome: yes, no, or refund (tie/N/A)",
+    )
+    @app_commands.choices(
+        outcome=[
+            app_commands.Choice(name="YES", value="yes"),
+            app_commands.Choice(name="NO", value="no"),
+            app_commands.Choice(name="Refund (tie / N/A)", value="refund"),
+        ]
+    )
+    async def bet_resolve(
+        self,
+        interaction: discord.Interaction,
+        bet_id: int,
+        outcome: app_commands.Choice[str],
+    ) -> None:
+        if not interaction.guild:
+            await interaction.response.send_message(
+                "This command can only be used in a server.", ephemeral=True
+            )
+            return
+
+        bet = await self.db.get_bet(bet_id)
+        if not bet or bet.guild_id != interaction.guild.id:
+            await interaction.response.send_message("Bet not found.", ephemeral=True)
+            return
+
+        if not await self._is_admin_or_creator(interaction, bet.creator_id):
+            await interaction.response.send_message(
+                "Only the bet creator or a server admin can resolve this bet.",
+                ephemeral=True,
+            )
+            return
+
+        # Auto-close if still open but past close time or manually resolving early.
+        if bet.status == BetStatus.OPEN:
+            await BetService(self.db).close_bet(bet_id)
+            bet = await self.db.get_bet(bet_id)
+            assert bet is not None
+
+        service = BetService(self.db)
+        try:
+            resolved, payouts = await service.resolve_bet(
+                bet_id, BetOutcome(outcome.value)
+            )
+        except ValueError as exc:
+            await interaction.response.send_message(str(exc), ephemeral=True)
+            return
+
+        wagers = await self.db.get_wagers_for_bet(bet_id)
+        creator = interaction.guild.get_member(bet.creator_id)
+        embed = build_bet_embed(
+            resolved,
+            creator=creator,
+            wagers=wagers,
+            footer_extra="Betting closed",
+        )
+
+        lines = []
+        for wager, payout in payouts:
+            if outcome.value == "refund":
+                lines.append(f"<@{wager.user_id}> refunded **{payout}**")
+            else:
+                lines.append(
+                    f"<@{wager.user_id}> won **{payout}** "
+                    f"({emoji_from_pick(wager.pick)} {wager.amount} @ "
+                    f"{resolved.yes_odds if wager.pick == WagerPick.YES else resolved.no_odds}x)"
+                )
+
+        result_text = "\n".join(lines) if lines else "_No winning wagers._"
+        await interaction.response.send_message(
+            content=f"Bet #{bet_id} resolved.\n{result_text}",
+            embed=embed,
+        )
+
+        message = await self._get_bet_message(resolved)
+        if message:
+            await message.edit(embed=embed)
+
+        self.bot.untrack_bet(bet_id)
+
+    @app_commands.command(name="bet_cancel", description="Cancel an unresolved bet and refund wagers")
+    async def bet_cancel(self, interaction: discord.Interaction, bet_id: int) -> None:
+        if not interaction.guild:
+            await interaction.response.send_message(
+                "This command can only be used in a server.", ephemeral=True
+            )
+            return
+
+        bet = await self.db.get_bet(bet_id)
+        if not bet or bet.guild_id != interaction.guild.id:
+            await interaction.response.send_message("Bet not found.", ephemeral=True)
+            return
+
+        if not await self._is_admin_or_creator(interaction, bet.creator_id):
+            await interaction.response.send_message(
+                "Only the bet creator or a server admin can cancel this bet.",
+                ephemeral=True,
+            )
+            return
+
+        service = BetService(self.db)
+        try:
+            wagers = await service.cancel_bet(bet_id)
+        except ValueError as exc:
+            await interaction.response.send_message(str(exc), ephemeral=True)
+            return
+
+        bet = await self.db.get_bet(bet_id)
+        assert bet is not None
+        creator = interaction.guild.get_member(bet.creator_id)
+        embed = build_bet_embed(bet, creator=creator, footer_extra="Cancelled — all wagers refunded")
+
+        await interaction.response.send_message(
+            f"Bet #{bet_id} cancelled. Refunded **{len(wagers)}** wager(s).",
+            embed=embed,
+        )
+
+        message = await self._get_bet_message(bet)
+        if message:
+            await message.edit(embed=embed)
+
+        self.bot.untrack_bet(bet_id)
+
+    @app_commands.command(name="bet_status", description="Show bet details and participants")
+    async def bet_status(self, interaction: discord.Interaction, bet_id: int) -> None:
+        if not interaction.guild:
+            await interaction.response.send_message(
+                "This command can only be used in a server.", ephemeral=True
+            )
+            return
+
+        bet = await self.db.get_bet(bet_id)
+        if not bet or bet.guild_id != interaction.guild.id:
+            await interaction.response.send_message("Bet not found.", ephemeral=True)
+            return
+
+        wagers = await self.db.get_wagers_for_bet(bet_id)
+        creator = interaction.guild.get_member(bet.creator_id)
+        embed = build_bet_embed(bet, creator=creator, wagers=wagers)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @app_commands.command(name="my_bets", description="Show your active and recent bets")
+    async def my_bets(self, interaction: discord.Interaction) -> None:
+        if not interaction.guild:
+            await interaction.response.send_message(
+                "This command can only be used in a server.", ephemeral=True
+            )
+            return
+
+        bets = await self.db.get_user_bets(interaction.guild.id, interaction.user.id)
+        if not bets:
+            await interaction.response.send_message(
+                "You have no bets in this server yet.", ephemeral=True
+            )
+            return
+
+        lines = []
+        for bet in bets:
+            wager = await self.db.get_wager(bet.id, interaction.user.id)
+            extra = ""
+            if wager:
+                extra = f" — your wager: {emoji_from_pick(wager.pick)} {wager.amount}"
+            elif bet.creator_id == interaction.user.id:
+                extra = " — you created this bet"
+            lines.append(f"**#{bet.id}** [{bet.status.value}] {bet.question}{extra}")
+
+        embed = discord.Embed(
+            title="Your bets",
+            description="\n".join(lines[:10]),
+            color=discord.Color.blurple(),
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @app_commands.command(name="leaderboard", description="Top balances in this server")
+    async def leaderboard(self, interaction: discord.Interaction) -> None:
+        if not interaction.guild:
+            await interaction.response.send_message(
+                "This command can only be used in a server.", ephemeral=True
+            )
+            return
+
+        rows = await self.db.get_leaderboard(interaction.guild.id, limit=10)
+        if not rows:
+            await interaction.response.send_message(
+                "No balances recorded yet. Place a bet to get started!",
+                ephemeral=True,
+            )
+            return
+
+        medals = ["🥇", "🥈", "🥉"]
+        lines = []
+        for idx, row in enumerate(rows):
+            prefix = medals[idx] if idx < 3 else f"{idx + 1}."
+            lines.append(f"{prefix} <@{row.user_id}> — **{row.balance}** coins")
+
+        embed = discord.Embed(
+            title=f"{interaction.guild.name} Leaderboard",
+            description="\n".join(lines),
+            color=discord.Color.gold(),
+        )
+        await interaction.response.send_message(embed=embed)
+
+    async def _get_bet_message(self, bet) -> discord.Message | None:
+        channel = self.bot.get_channel(bet.channel_id)
+        if not channel or not bet.message_id:
+            return None
+        try:
+            return await channel.fetch_message(bet.message_id)
+        except discord.NotFound:
+            return None
+
+    @commands.Cog.listener()
+    async def on_raw_reaction_add(self, payload: discord.RawReactionActionEvent) -> None:
+        if payload.user_id == self.bot.user.id:
+            return
+
+        emoji = str(payload.emoji)
+        pick = pick_from_emoji(emoji)
+        if not pick:
+            return
+
+        bet = await self.db.get_bet_by_message(payload.message_id)
+        if not bet or bet.status != BetStatus.OPEN:
+            return
+
+        if datetime.now(timezone.utc) >= bet.close_time:
+            await BetService(self.db).close_bet(bet.id)
+            await self.bot.refresh_bet_message(bet.id)
+            return
+
+        user = self.bot.get_user(payload.user_id) or await self.bot.fetch_user(
+            payload.user_id
+        )
+        view = WagerButtonView(
+            self.bot, bet.id, pick, bet.guild_id, owner_id=payload.user_id
+        )
+
+        prompt = (
+            f"You're joining bet **#{bet.id}** with **{pick.value.upper()}**.\n"
+            f"Click **Enter wager** to set your amount."
+        )
+
+        try:
+            await user.send(prompt, view=view)
+        except discord.Forbidden:
+            channel = self.bot.get_channel(payload.channel_id)
+            if channel:
+                await channel.send(
+                    f"{user.mention} I couldn't DM you. Click below to enter your wager:",
+                    view=view,
+                    delete_after=120,
+                )
+
+    @commands.Cog.listener()
+    async def on_raw_reaction_remove(
+        self, payload: discord.RawReactionActionEvent
+    ) -> None:
+        if payload.user_id == self.bot.user.id:
+            return
+
+        pick = pick_from_emoji(str(payload.emoji))
+        if not pick:
+            return
+
+        bet = await self.db.get_bet_by_message(payload.message_id)
+        if not bet or bet.status != BetStatus.OPEN:
+            return
+
+        service = BetService(self.db)
+        refunded = await service.remove_wager_and_refund(
+            bet.guild_id, bet.id, payload.user_id
+        )
+        if refunded:
+            await self.bot.refresh_bet_message(bet.id)
+            user = self.bot.get_user(payload.user_id) or await self.bot.fetch_user(
+                payload.user_id
+            )
+            try:
+                await user.send(
+                    f"Your wager of **{refunded}** on bet #{bet.id} was removed and refunded."
+                )
+            except discord.Forbidden:
+                pass
+
