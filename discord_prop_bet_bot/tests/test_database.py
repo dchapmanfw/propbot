@@ -75,4 +75,5 @@ async def test_leaderboard_ordering(db: Database):
     board = await db.get_leaderboard(1)
     assert board[0].user_id == 1
     assert board[0].balance == STARTING_BALANCE + 500
+    assert board[0].reset_count == 0
     assert board[1].user_id == 2

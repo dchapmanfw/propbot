@@ -15,6 +15,7 @@ from bets import (
     DurationParseError,
     build_bet_embed,
     build_help_embed,
+    compute_max_wager,
     emoji_from_pick,
     parse_duration,
     pick_from_emoji,
@@ -22,6 +23,12 @@ from bets import (
 )
 from config import NO_EMOJI, YES_EMOJI
 from models import Bet, BetOutcome, BetStatus, Wager, WagerPick
+
+
+def test_compute_max_wager():
+    assert compute_max_wager(500) == 500
+    assert compute_max_wager(200, existing_wager_amount=100) == 300
+    assert compute_max_wager(0) == 0
 
 
 def _bet(**kwargs) -> Bet:
@@ -64,9 +71,24 @@ def test_parse_duration_seconds():
 
 
 def test_build_bet_embed_open_without_wagers():
-    embed = build_bet_embed(_bet(status=BetStatus.OPEN))
+    embed = build_bet_embed(_bet(status=BetStatus.OPEN), bookie_balance=1000)
     data = embed.to_dict()
     assert "How to join" in str(data)
+    assert "Max bet" in str(data)
+
+
+def test_build_bet_embed_open_shows_side_max_bets():
+    embed = build_bet_embed(_bet(status=BetStatus.OPEN), bookie_balance=1000)
+    data = str(embed.to_dict())
+    assert "Max bet" in data
+
+
+def test_build_bet_embed_resolved_omits_max_bet():
+    embed = build_bet_embed(
+        _bet(status=BetStatus.RESOLVED, outcome=BetOutcome.YES),
+        bookie_balance=1000,
+    )
+    assert "Max bet" not in str(embed.to_dict())
 
 
 def test_build_bet_embed_open_with_wagers_and_creator():

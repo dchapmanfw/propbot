@@ -247,6 +247,29 @@ async def test_maybe_prompt_prompts_when_pick_differs_from_existing_wager(reacti
     )
 
     cog._notify_user.assert_awaited_once()
+    prompt = cog._notify_user.await_args.args[2]
+    assert "Max wager:" in prompt
+
+
+@pytest.mark.asyncio
+async def test_maybe_prompt_max_wager_includes_existing_escrow(reaction_cog):
+    from config import STARTING_BALANCE
+
+    cog, db, bot = reaction_cog
+    bet_id = await _open_bet(db)
+    await db.ensure_user(GUILD_ID, BETTOR_ID)
+    await db.adjust_balance(GUILD_ID, BETTOR_ID, -800)
+    await db.upsert_wager(bet_id, BETTOR_ID, WagerPick.NO, 100)
+    bet = await _get_bet(db, bet_id)
+    cog._notify_user = AsyncMock()
+
+    await cog._maybe_prompt_wager_for_reaction(
+        bet, BETTOR_ID, WagerPick.YES, CHANNEL_ID
+    )
+
+    expected_max = STARTING_BALANCE - 800 + 100
+    prompt = cog._notify_user.await_args.args[2]
+    assert f"**{expected_max}**" in prompt
 
 
 @pytest.mark.asyncio

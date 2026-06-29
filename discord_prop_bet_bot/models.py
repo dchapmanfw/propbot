@@ -28,6 +28,7 @@ class UserBalance:
     guild_id: int
     user_id: int
     balance: int
+    reset_count: int = 0
 
 
 @dataclass

@@ -166,6 +166,33 @@ async def test_balance_command(cog, db):
 
 
 @pytest.mark.asyncio
+async def test_reset_and_redeem_commands(cog, db):
+    interaction = make_interaction(guild=False)
+    await call_slash(cog, cog.reset_balance, interaction)
+    interaction.response.send_message.assert_awaited_once()
+
+    interaction = make_interaction(user_id=BETTOR_ID)
+    await call_slash(cog, cog.reset_balance, interaction)
+    interaction.response.defer.assert_awaited_once_with(ephemeral=True)
+    interaction.followup.send.assert_awaited_once()
+
+    await db.ensure_user(1, BETTOR_ID)
+    await db.adjust_balance(1, BETTOR_ID, -500)
+    interaction = make_interaction(user_id=BETTOR_ID)
+    await call_slash(cog, cog.reset_balance, interaction)
+    interaction.followup.send.assert_awaited()
+
+    interaction = make_interaction(guild=False)
+    await call_slash(cog, cog.redeem_reset, interaction)
+    interaction.response.send_message.assert_awaited_once()
+
+    interaction = make_interaction(user_id=BETTOR_ID)
+    await call_slash(cog, cog.redeem_reset, interaction)
+    interaction.response.defer.assert_awaited_once_with(ephemeral=True)
+    interaction.followup.send.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_balance_command_no_guild(cog):
     interaction = make_interaction(guild=False)
     await call_slash(cog, cog.balance, interaction)

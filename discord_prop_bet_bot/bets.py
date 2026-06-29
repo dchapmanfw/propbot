@@ -9,7 +9,7 @@ import discord
 
 from config import ALLOWED_CHANNEL_ID, NO_EMOJI, STARTING_BALANCE, YES_EMOJI
 from database import Database
-from models import Bet, BetOutcome, BetStatus, Wager, WagerPick
+from models import Bet, BetOutcome, BetStatus, UserBalance, Wager, WagerPick
 
 # Matches durations like "2h", "30m", "1d", "2 hours", "45 min".
 _DURATION_PATTERN = re.compile(
@@ -82,6 +82,68 @@ def compute_bookie_reserve(
     return pool, yes_payout, no_payout, required_reserve
 
 
+def compute_max_wager(balance: int, existing_wager_amount: int = 0) -> int:
+    """Maximum wager a bettor can place (existing escrow on this bet is refunded first)."""
+    return max(0, balance + existing_wager_amount)
+
+
+_BOOKIE_MAX_SEARCH = 10_000_000
+
+
+def compute_bookie_max_additional_wager(
+    bet: Bet,
+    wagers: list[Wager],
+    pick: WagerPick,
+    bookie_balance: int,
+) -> int | None:
+    """
+    Largest wager a new bettor can add on pick without exceeding bookie reserve.
+
+    Returns None when the bookie can accept any practical amount on that side.
+    """
+
+    def accepts(amount: int) -> bool:
+        if amount <= 0:
+            return amount == 0
+        hypothetical = list(wagers) + [
+            Wager(id=0, bet_id=bet.id, user_id=-1, pick=pick, amount=amount)
+        ]
+        _, _, _, new_reserve = compute_bookie_reserve(
+            hypothetical, bet.yes_odds, bet.no_odds
+        )
+        reserve_delta = new_reserve - bet.bookie_reserve
+        return reserve_delta <= 0 or bookie_balance >= reserve_delta
+
+    if not accepts(1):
+        return 0
+
+    lo, hi = 1, 1
+    while hi < _BOOKIE_MAX_SEARCH and accepts(hi):
+        lo = hi
+        hi *= 2
+
+    if hi >= _BOOKIE_MAX_SEARCH and accepts(_BOOKIE_MAX_SEARCH):
+        return None
+
+    best = lo
+    left, right = lo, min(hi - 1, _BOOKIE_MAX_SEARCH)
+    while left <= right:
+        mid = (left + right) // 2
+        if accepts(mid):
+            best = mid
+            left = mid + 1
+        else:
+            right = mid - 1
+    return best
+
+
+def format_side_max_bet(max_wager: int | None) -> str:
+    """Format bookie-side max bet for embed display."""
+    if max_wager is None:
+        return "No limit"
+    return str(max_wager)
+
+
 def _hypothetical_wagers(
     bet_id: int,
     wagers: list[Wager],
@@ -118,11 +180,64 @@ def status_label(status: BetStatus) -> str:
     }[status]
 
 
+def format_anti_prestige(reset_count: int) -> str:
+    """Leaderboard suffix for users who have reset."""
+    if reset_count <= 0:
+        return ""
+    return f" · ↩️×{reset_count}"
+
+
+def format_balance_message(user: UserBalance) -> str:
+    """User-facing balance text including debt and anti-prestige."""
+    from economy import REDEMPTION_COST
+
+    if user.balance < 0:
+        balance_line = f"Your balance: **{user.balance}** coins (bookie debt)."
+    else:
+        balance_line = f"Your balance: **{user.balance}** coins."
+
+    lines = [balance_line]
+    if user.reset_count > 0:
+        lines.append(
+            f"Anti-prestige: **↩️×{user.reset_count}** "
+            f"(pay **{REDEMPTION_COST}** with `/redeem` to clear one)"
+        )
+    return "\n".join(lines)
+
+
+def build_leaderboard_description(rows: list[UserBalance]) -> str:
+    """Format leaderboard rows with anti-prestige markers and optional tier headers."""
+    medals = ["🥇", "🥈", "🥉"]
+    has_clean = any(row.reset_count == 0 for row in rows)
+    has_reset = any(row.reset_count > 0 for row in rows)
+    use_tier_headers = has_clean and has_reset
+
+    lines: list[str] = []
+    current_tier: str | None = None
+
+    for idx, row in enumerate(rows):
+        tier = "clean" if row.reset_count == 0 else "reset"
+        if use_tier_headers and tier != current_tier:
+            if lines:
+                lines.append("")
+            lines.append("**No resets**" if tier == "clean" else "**↩️×1+**")
+            current_tier = tier
+
+        prefix = medals[idx] if idx < 3 else f"{idx + 1}."
+        prestige = format_anti_prestige(row.reset_count)
+        lines.append(
+            f"{prefix} <@{row.user_id}> — **{row.balance}** coins{prestige}"
+        )
+
+    return "\n".join(lines)
+
+
 def build_bet_embed(
     bet: Bet,
     creator: discord.abc.User | None = None,
     wagers: list[Wager] | None = None,
     footer_extra: str | None = None,
+    bookie_balance: int | None = None,
 ) -> discord.Embed:
     """Build the public embed shown on bet messages."""
     color = {
@@ -147,8 +262,33 @@ def build_bet_embed(
         value=discord.utils.format_dt(bet.close_time, style="R"),
         inline=True,
     )
-    embed.add_field(name="YES odds", value=f"{bet.yes_odds:.2f}x", inline=True)
-    embed.add_field(name="NO odds", value=f"{bet.no_odds:.2f}x", inline=True)
+    wagers_list = wagers or []
+    if bet.status == BetStatus.OPEN and bookie_balance is not None:
+        max_yes = compute_bookie_max_additional_wager(
+            bet, wagers_list, WagerPick.YES, bookie_balance
+        )
+        max_no = compute_bookie_max_additional_wager(
+            bet, wagers_list, WagerPick.NO, bookie_balance
+        )
+        embed.add_field(
+            name="YES odds",
+            value=(
+                f"{bet.yes_odds:.2f}x\n"
+                f"Max bet: **{format_side_max_bet(max_yes)}**"
+            ),
+            inline=True,
+        )
+        embed.add_field(
+            name="NO odds",
+            value=(
+                f"{bet.no_odds:.2f}x\n"
+                f"Max bet: **{format_side_max_bet(max_no)}**"
+            ),
+            inline=True,
+        )
+    else:
+        embed.add_field(name="YES odds", value=f"{bet.yes_odds:.2f}x", inline=True)
+        embed.add_field(name="NO odds", value=f"{bet.no_odds:.2f}x", inline=True)
     if bet.status in (BetStatus.OPEN, BetStatus.CLOSED):
         embed.add_field(
             name="Pool / reserve",
@@ -259,6 +399,8 @@ def build_help_embed() -> discord.Embed:
             "`/bet_cancel bet_id` — cancel and refund all wagers (creator or admin)\n"
             "`/my_bets` — your recent and active bets\n"
             "`/leaderboard` — top balances in this server\n"
+            "`/reset` — bail out to starting cash (adds anti-prestige ↩️)\n"
+            "`/redeem` — pay 2× starting balance to clear one ↩️\n"
             "`/help` — show this guide"
         ),
         inline=False,
@@ -269,7 +411,8 @@ def build_help_embed() -> discord.Embed:
         value=(
             "• Set **yes_odds** and **no_odds** separately to shape action on each side\n"
             "• Your balance must cover **reserve** (worst-case payout) as wagers come in\n"
-            "• If payouts exceed the pool, the shortfall comes from your balance (can go negative)"
+            "• If payouts exceed the pool, the shortfall comes from your balance (can go negative)\n"
+            "• Use `/reset` when below starting balance to bail out — costs leaderboard prestige (↩️)"
         ),
         inline=False,
     )

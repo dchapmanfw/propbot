@@ -16,13 +16,17 @@ from bets import (
     DurationParseError,
     build_bet_embed,
     build_help_embed,
+    build_leaderboard_description,
+    compute_max_wager,
     emoji_from_pick,
+    format_balance_message,
     parse_duration,
     pick_from_emoji,
 )
 from channel_policy import allowed_channel_message, is_allowed_channel
 from config import ALLOWED_CHANNEL_ID, NO_EMOJI, YES_EMOJI
 from database import Database
+from economy import EconomyService, REDEMPTION_COST
 from models import BetOutcome, BetStatus, WagerPick
 
 if TYPE_CHECKING:
@@ -226,10 +230,16 @@ class PropBetCommands(commands.Cog):
         if not self._should_prompt_wager(user_id, bet.id):
             return
 
+        await self.db.ensure_user(bet.guild_id, user_id)
+        balance = await self.db.get_balance(bet.guild_id, user_id) or 0
+        existing_amount = existing.amount if existing else 0
+        max_wager = compute_max_wager(balance, existing_amount)
+
         user = self.bot.get_user(user_id) or await self.bot.fetch_user(user_id)
         view = WagerButtonView(self.bot, bet.id, pick, bet.guild_id, owner_id=user_id)
         prompt = (
             f"You're joining bet **#{bet.id}** with **{pick.value.upper()}**.\n"
+            f"Max wager: **{max_wager}** coins.\n"
             f"Click **Enter wager** to set your amount."
         )
         await self._notify_user(
@@ -336,8 +346,69 @@ class PropBetCommands(commands.Cog):
         await interaction.response.defer(ephemeral=True)
 
         user = await self.db.ensure_user(interaction.guild.id, interaction.user.id)
+        await interaction.followup.send(format_balance_message(user))
+
+    @app_commands.command(
+        name="reset",
+        description="Bail out to starting cash (adds anti-prestige on the leaderboard)",
+    )
+    async def reset_balance(self, interaction: discord.Interaction) -> None:
+        if not interaction.guild:
+            await interaction.response.send_message(
+                "This command can only be used in a server.", ephemeral=True
+            )
+            return
+        if not await self._require_allowed_channel(interaction):
+            return
+
+        await interaction.response.defer(ephemeral=True)
+
+        service = EconomyService(self.db)
+        try:
+            user = await service.reset_balance(
+                interaction.guild.id, interaction.user.id
+            )
+        except ValueError as exc:
+            await interaction.followup.send(str(exc))
+            return
+
         await interaction.followup.send(
-            f"Your balance: **{user.balance}** coins.",
+            f"Balance reset to **{user.balance}** coins. "
+            f"Anti-prestige is now **↩️×{user.reset_count}**."
+        )
+
+    @app_commands.command(
+        name="redeem",
+        description="Pay 2× starting balance to remove one anti-prestige level",
+    )
+    async def redeem_reset(self, interaction: discord.Interaction) -> None:
+        if not interaction.guild:
+            await interaction.response.send_message(
+                "This command can only be used in a server.", ephemeral=True
+            )
+            return
+        if not await self._require_allowed_channel(interaction):
+            return
+
+        await interaction.response.defer(ephemeral=True)
+
+        service = EconomyService(self.db)
+        try:
+            user = await service.redeem_reset(
+                interaction.guild.id, interaction.user.id
+            )
+        except ValueError as exc:
+            await interaction.followup.send(str(exc))
+            return
+
+        prestige_note = (
+            f"Anti-prestige is now **↩️×{user.reset_count}**."
+            if user.reset_count > 0
+            else "Your anti-prestige record is clear."
+        )
+        await interaction.followup.send(
+            f"Paid **{REDEMPTION_COST}** coins. {prestige_note} "
+            f"Remaining balance: **{user.balance}** coins."
         )
 
     @app_commands.command(
@@ -393,7 +464,13 @@ class PropBetCommands(commands.Cog):
             no_odds=no_odds,
         )
 
-        embed = build_bet_embed(bet, creator=interaction.user)
+        embed = build_bet_embed(
+            bet,
+            creator=interaction.user,
+            bookie_balance=await self.db.get_balance(
+                interaction.guild.id, interaction.user.id
+            ),
+        )
         await interaction.edit_original_response(embed=embed)
         message = await interaction.original_response()
 
@@ -586,7 +663,17 @@ class PropBetCommands(commands.Cog):
 
         wagers = await self.db.get_wagers_for_bet(bet_id)
         creator = interaction.guild.get_member(bet.creator_id)
-        embed = build_bet_embed(bet, creator=creator, wagers=wagers)
+        bookie_balance = None
+        if bet.status == BetStatus.OPEN:
+            bookie_balance = await self.db.get_balance(
+                bet.guild_id, bet.creator_id
+            )
+        embed = build_bet_embed(
+            bet,
+            creator=creator,
+            wagers=wagers,
+            bookie_balance=bookie_balance,
+        )
         await interaction.followup.send(embed=embed)
 
     @app_commands.command(name="my_bets", description="Show your active and recent bets")
@@ -644,16 +731,13 @@ class PropBetCommands(commands.Cog):
             )
             return
 
-        medals = ["🥇", "🥈", "🥉"]
-        lines = []
-        for idx, row in enumerate(rows):
-            prefix = medals[idx] if idx < 3 else f"{idx + 1}."
-            lines.append(f"{prefix} <@{row.user_id}> — **{row.balance}** coins")
-
         embed = discord.Embed(
             title=f"{interaction.guild.name} Leaderboard",
-            description="\n".join(lines),
+            description=build_leaderboard_description(rows),
             color=discord.Color.gold(),
+        )
+        embed.set_footer(
+            text="Ranked by prestige (no resets first), then balance. ↩️ = bailout count."
         )
         await interaction.followup.send(embed=embed)
 

@@ -80,6 +80,17 @@ def _row_to_bet(row: aiosqlite.Row) -> Bet:
     )
 
 
+def _row_to_user_balance(row: aiosqlite.Row) -> UserBalance:
+    keys = row.keys()
+    reset_count = int(row["reset_count"]) if "reset_count" in keys else 0
+    return UserBalance(
+        row["guild_id"],
+        row["user_id"],
+        int(row["balance"]),
+        reset_count,
+    )
+
+
 def _row_to_wager(row: aiosqlite.Row) -> Wager:
     return Wager(
         id=row["id"],
@@ -118,6 +129,13 @@ class Database:
         if "bookie_reserve" not in columns:
             await self.conn.execute(
                 "ALTER TABLE bets ADD COLUMN bookie_reserve INTEGER NOT NULL DEFAULT 0"
+            )
+
+        cursor = await self.conn.execute("PRAGMA table_info(users)")
+        user_columns = {row[1] for row in await cursor.fetchall()}
+        if "reset_count" not in user_columns:
+            await self.conn.execute(
+                "ALTER TABLE users ADD COLUMN reset_count INTEGER NOT NULL DEFAULT 0"
             )
 
     async def close(self) -> None:
@@ -159,9 +177,9 @@ class Database:
             (guild_id, user_id, STARTING_BALANCE),
         )
         await self._commit_if(commit)
-        balance = await self.get_balance(guild_id, user_id)
-        assert balance is not None
-        return UserBalance(guild_id, user_id, balance)
+        user = await self.get_user(guild_id, user_id)
+        assert user is not None
+        return user
 
     async def ensure_users(
         self,
@@ -180,6 +198,18 @@ class Database:
                 (guild_id, user_id, STARTING_BALANCE),
             )
         await self._commit_if(commit)
+
+    async def get_user(self, guild_id: int, user_id: int) -> UserBalance | None:
+        cursor = await self.conn.execute(
+            """
+            SELECT guild_id, user_id, balance, reset_count
+            FROM users
+            WHERE guild_id = ? AND user_id = ?
+            """,
+            (guild_id, user_id),
+        )
+        row = await cursor.fetchone()
+        return _row_to_user_balance(row) if row else None
 
     async def get_balance(self, guild_id: int, user_id: int) -> int | None:
         cursor = await self.conn.execute(
@@ -236,6 +266,85 @@ class Database:
         balance = await self.get_balance(guild_id, user_id)
         assert balance is not None
         return balance
+
+    async def has_active_exposure(self, guild_id: int, user_id: int) -> bool:
+        """True if user has wagers on open bets or unresolved bookie liability."""
+        cursor = await self.conn.execute(
+            """
+            SELECT 1
+            FROM wagers w
+            JOIN bets b ON b.id = w.bet_id
+            WHERE b.guild_id = ? AND w.user_id = ? AND b.status = ?
+            LIMIT 1
+            """,
+            (guild_id, user_id, BetStatus.OPEN.value),
+        )
+        if await cursor.fetchone():
+            return True
+
+        cursor = await self.conn.execute(
+            """
+            SELECT 1
+            FROM bets
+            WHERE guild_id = ? AND creator_id = ?
+              AND status IN (?, ?)
+            LIMIT 1
+            """,
+            (
+                guild_id,
+                user_id,
+                BetStatus.OPEN.value,
+                BetStatus.CLOSED.value,
+            ),
+        )
+        return await cursor.fetchone() is not None
+
+    async def reset_user_balance(
+        self,
+        guild_id: int,
+        user_id: int,
+        *,
+        commit: bool = True,
+    ) -> UserBalance:
+        """Set balance to starting amount and increment reset_count."""
+        await self.conn.execute(
+            """
+            UPDATE users
+            SET balance = ?, reset_count = reset_count + 1
+            WHERE guild_id = ? AND user_id = ?
+            """,
+            (STARTING_BALANCE, guild_id, user_id),
+        )
+        await self._commit_if(commit)
+        user = await self.get_user(guild_id, user_id)
+        assert user is not None
+        return user
+
+    async def redeem_reset(
+        self,
+        guild_id: int,
+        user_id: int,
+        cost: int,
+        *,
+        commit: bool = True,
+    ) -> UserBalance:
+        """Pay cost to remove one reset from anti-prestige."""
+        cursor = await self.conn.execute(
+            """
+            UPDATE users
+            SET balance = balance - ?, reset_count = reset_count - 1
+            WHERE guild_id = ? AND user_id = ?
+              AND reset_count > 0
+              AND balance >= ?
+            """,
+            (cost, guild_id, user_id, cost),
+        )
+        if cursor.rowcount == 0:
+            raise ValueError("Cannot redeem reset.")
+        await self._commit_if(commit)
+        user = await self.get_user(guild_id, user_id)
+        assert user is not None
+        return user
 
     async def set_bet_escrow(
         self,
@@ -504,15 +613,13 @@ class Database:
     async def get_leaderboard(self, guild_id: int, limit: int = 10) -> list[UserBalance]:
         cursor = await self.conn.execute(
             """
-            SELECT guild_id, user_id, balance
+            SELECT guild_id, user_id, balance, reset_count
             FROM users
             WHERE guild_id = ?
-            ORDER BY balance DESC
+            ORDER BY reset_count ASC, balance DESC
             LIMIT ?
             """,
             (guild_id, limit),
         )
         rows = await cursor.fetchall()
-        return [
-            UserBalance(row["guild_id"], row["user_id"], row["balance"]) for row in rows
-        ]
+        return [_row_to_user_balance(row) for row in rows]

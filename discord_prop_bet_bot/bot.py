@@ -15,7 +15,7 @@ from config import (
     UNRESOLVED_REFUND_AFTER,
 )
 from database import Database
-from models import Bet
+from models import Bet, BetStatus
 
 logging.basicConfig(
     level=logging.INFO,
@@ -108,8 +108,15 @@ class PropBetBot(commands.Bot):
         guild = channel.guild if hasattr(channel, "guild") else None
         creator = guild.get_member(bet.creator_id) if guild else None
         wagers = await self.db.get_wagers_for_bet(bet_id)
+        bookie_balance = None
+        if bet.status == BetStatus.OPEN:
+            bookie_balance = await self.db.get_balance(bet.guild_id, bet.creator_id)
         embed = build_bet_embed(
-            bet, creator=creator, wagers=wagers, footer_extra=footer_extra
+            bet,
+            creator=creator,
+            wagers=wagers,
+            footer_extra=footer_extra,
+            bookie_balance=bookie_balance,
         )
         await message.edit(embed=embed)
 
