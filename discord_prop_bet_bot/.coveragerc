@@ -1,0 +1,18 @@
+[run]
+source = .
+omit =
+    tests/*
+    .venv/*
+
+[report]
+# Per-module minimums are enforced in tests/conftest.py (pytest_terminal_summary).
+# Total minimum is also set via pytest.ini --cov-fail-under=75.
+exclude_lines =
+    pragma: no cover
+    if TYPE_CHECKING:
+    if __name__ == .__main__.:
+precision = 1
+show_missing = True
+
+[html]
+directory = htmlcov
