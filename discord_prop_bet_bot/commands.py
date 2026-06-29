@@ -130,6 +130,7 @@ class PropBetCommands(commands.Cog):
     def __init__(self, bot: PropBetBot) -> None:
         self.bot = bot
         self.db: Database = bot.db
+        self._reactions_reconciled = False
 
     async def _notify_user(
         self,
@@ -142,22 +143,45 @@ class PropBetCommands(commands.Cog):
         prefer_channel: bool = False,
     ) -> None:
         """Deliver a message via DM, falling back to the bet channel on failure."""
-        channel = self.bot.get_channel(channel_id)
+        channel = await self.bot.fetch_channel(channel_id)
         channel_content = f"{user.mention} {content}"
 
         if prefer_channel and channel is not None:
-            await channel.send(channel_content, view=view, delete_after=delete_after)
+            try:
+                await channel.send(
+                    channel_content, view=view, delete_after=delete_after
+                )
+            except discord.HTTPException as exc:
+                logger.warning(
+                    "Could not notify user %s in channel %s: %s",
+                    user.id,
+                    channel_id,
+                    exc,
+                )
             return
 
         try:
             await user.send(content, view=view)
         except (discord.Forbidden, discord.HTTPException) as exc:
-            logger.debug("DM to %s failed (%s), using channel fallback", user.id, exc)
-            if channel is not None:
+            logger.info("DM to %s failed (%s), using channel fallback", user.id, exc)
+            if channel is None:
+                logger.warning(
+                    "Could not notify user %s: DM failed and channel %s unavailable",
+                    user.id,
+                    channel_id,
+                )
+                return
+            try:
                 await channel.send(
                     channel_content,
                     view=view,
                     delete_after=delete_after or 120,
+                )
+            except discord.HTTPException as send_exc:
+                logger.warning(
+                    "Channel fallback notify failed for user %s: %s",
+                    user.id,
+                    send_exc,
                 )
 
     def _should_prompt_wager(self, user_id: int, bet_id: int) -> bool:
@@ -167,6 +191,97 @@ class PropBetCommands(commands.Cog):
             return False
         self.bot._wager_prompt_at[key] = time.monotonic()
         return True
+
+    async def _maybe_prompt_wager_for_reaction(
+        self,
+        bet,
+        user_id: int,
+        pick: WagerPick,
+        channel_id: int,
+    ) -> None:
+        """DM (or channel-fallback) a user to enter a wager after they react."""
+        if user_id == self.bot.user.id:
+            return
+
+        if datetime.now(timezone.utc) >= bet.close_time:
+            await BetService(self.db).close_bet(bet.id)
+            await self.bot.refresh_bet_message(bet.id)
+            return
+
+        if user_id == bet.creator_id:
+            user = self.bot.get_user(user_id) or await self.bot.fetch_user(user_id)
+            await self._notify_user(
+                user,
+                channel_id,
+                "You cannot wager on a bet you created.",
+                delete_after=15,
+                prefer_channel=True,
+            )
+            return
+
+        existing = await self.db.get_wager(bet.id, user_id)
+        if existing and existing.pick == pick:
+            return
+
+        if not self._should_prompt_wager(user_id, bet.id):
+            return
+
+        user = self.bot.get_user(user_id) or await self.bot.fetch_user(user_id)
+        view = WagerButtonView(self.bot, bet.id, pick, bet.guild_id, owner_id=user_id)
+        prompt = (
+            f"You're joining bet **#{bet.id}** with **{pick.value.upper()}**.\n"
+            f"Click **Enter wager** to set your amount."
+        )
+        await self._notify_user(
+            user,
+            channel_id,
+            prompt,
+            view=view,
+            delete_after=120,
+        )
+
+    async def _reconcile_open_bet_reactions(self) -> None:
+        """Prompt users who reacted while the bot was offline."""
+        open_bets = await self.db.get_open_bets()
+        for bet in open_bets:
+            if not bet.message_id:
+                continue
+            channel = await self.bot.fetch_channel(bet.channel_id)
+            if channel is None:
+                continue
+            try:
+                message = await channel.fetch_message(bet.message_id)
+            except discord.NotFound:
+                logger.warning(
+                    "Open bet #%d message %s not found during reaction reconcile",
+                    bet.id,
+                    bet.message_id,
+                )
+                continue
+            except discord.Forbidden:
+                logger.warning(
+                    "Missing access to open bet #%d message during reaction reconcile",
+                    bet.id,
+                )
+                continue
+
+            for reaction in message.reactions:
+                pick = pick_from_emoji(str(reaction.emoji))
+                if not pick:
+                    continue
+                async for user in reaction.users():
+                    if user.bot or user.id == bet.creator_id:
+                        continue
+                    await self._maybe_prompt_wager_for_reaction(
+                        bet, user.id, pick, bet.channel_id
+                    )
+
+    @commands.Cog.listener()
+    async def on_ready(self) -> None:
+        if self._reactions_reconciled:
+            return
+        self._reactions_reconciled = True
+        await self._reconcile_open_bet_reactions()
 
     async def _is_admin_or_creator(
         self, interaction: discord.Interaction, bet_creator_id: int
@@ -261,6 +376,8 @@ class PropBetCommands(commands.Cog):
             await interaction.response.send_message(str(exc), ephemeral=True)
             return
 
+        await interaction.response.defer()
+
         close_time = datetime.now(timezone.utc) + delta
         await self.db.ensure_user(interaction.guild.id, interaction.user.id)
 
@@ -275,7 +392,7 @@ class PropBetCommands(commands.Cog):
         )
 
         embed = build_bet_embed(bet, creator=interaction.user)
-        await interaction.response.send_message(embed=embed)
+        await interaction.edit_original_response(embed=embed)
         message = await interaction.original_response()
 
         await self.db.set_bet_message_id(bet.id, message.id)
@@ -554,49 +671,8 @@ class PropBetCommands(commands.Cog):
         if not bet or bet.status != BetStatus.OPEN:
             return
 
-        if datetime.now(timezone.utc) >= bet.close_time:
-            await BetService(self.db).close_bet(bet.id)
-            await self.bot.refresh_bet_message(bet.id)
-            return
-
-        if payload.user_id == bet.creator_id:
-            user = self.bot.get_user(payload.user_id) or await self.bot.fetch_user(
-                payload.user_id
-            )
-            await self._notify_user(
-                user,
-                payload.channel_id,
-                "You cannot wager on a bet you created.",
-                delete_after=15,
-                prefer_channel=True,
-            )
-            return
-
-        existing = await self.db.get_wager(bet.id, payload.user_id)
-        if existing and existing.pick == pick:
-            return
-
-        if not self._should_prompt_wager(payload.user_id, bet.id):
-            return
-
-        user = self.bot.get_user(payload.user_id) or await self.bot.fetch_user(
-            payload.user_id
-        )
-        view = WagerButtonView(
-            self.bot, bet.id, pick, bet.guild_id, owner_id=payload.user_id
-        )
-
-        prompt = (
-            f"You're joining bet **#{bet.id}** with **{pick.value.upper()}**.\n"
-            f"Click **Enter wager** to set your amount."
-        )
-
-        await self._notify_user(
-            user,
-            payload.channel_id,
-            prompt,
-            view=view,
-            delete_after=120,
+        await self._maybe_prompt_wager_for_reaction(
+            bet, payload.user_id, pick, payload.channel_id
         )
 
     @commands.Cog.listener()

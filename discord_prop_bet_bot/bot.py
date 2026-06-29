@@ -72,6 +72,22 @@ class PropBetBot(commands.Bot):
     def untrack_bet(self, bet_id: int) -> None:
         self._open_bet_ids.discard(bet_id)
 
+    async def fetch_channel(
+        self, channel_id: int
+    ) -> discord.abc.Messageable | None:
+        """Return a channel from cache, fetching from the API if needed."""
+        channel = self.get_channel(channel_id)
+        if channel is not None:
+            return channel
+        try:
+            fetched = await super().fetch_channel(channel_id)
+        except discord.HTTPException as exc:
+            logger.warning("Could not fetch channel %s: %s", channel_id, exc)
+            return None
+        if isinstance(fetched, discord.abc.Messageable):
+            return fetched
+        return None
+
     async def refresh_bet_message(
         self, bet_id: int, *, footer_extra: str | None = None
     ) -> None:
@@ -80,7 +96,7 @@ class PropBetBot(commands.Bot):
         if not bet or not bet.message_id:
             return
 
-        channel = self.get_channel(bet.channel_id)
+        channel = await self.fetch_channel(bet.channel_id)
         if not channel:
             return
 

@@ -5,3 +5,5 @@ aiosqlite>=0.19.0
 # Development / testing
 pytest>=7.4.0
 pytest-asyncio>=0.23.0
+pytest-cov>=4.1.0
+pytest-timeout>=2.3.0

@@ -191,6 +191,27 @@ pip install -r requirements.txt
 pytest -v
 ```
 
+`pytest` runs with coverage enabled by default (see `pytest.ini` and `tests/conftest.py`). Each test has a **30 second** timeout.
+
+### Coverage policy
+
+| Module | Minimum |
+|--------|---------|
+| `bets.py`, `database.py` | 90% |
+| `models.py` | 100% |
+| `channel_policy.py` | 90% |
+| `config.py` | 80% |
+| `commands.py`, `bot.py` | 70% |
+| **Total** | **75%** |
+
+An HTML report is written to `htmlcov/index.html`. See `.cursor/skills/unit-testing/SKILL.md` for testing conventions.
+
+To run tests without the coverage gate:
+
+```bash
+pytest -v --no-cov
+```
+
 Tests cover duration parsing, payouts, database operations, wagers, refunds, cancellation, and resolution.
 
 ### Manual Discord testing checklist
