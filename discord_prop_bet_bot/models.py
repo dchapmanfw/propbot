@@ -23,6 +23,11 @@ class WagerPick(str, Enum):
     NO = "no"
 
 
+class BetKind(str, Enum):
+    PROP = "prop"
+    MARKET = "market"
+
+
 @dataclass
 class UserBalance:
     guild_id: int
@@ -47,6 +52,19 @@ class Bet:
     created_at: datetime
     escrow_balance: int = 0
     bookie_reserve: int = 0
+    bet_kind: BetKind = BetKind.PROP
+    q_yes: float = 0.0
+    q_no: float = 0.0
+    liquidity_b: float = 100.0
+
+
+@dataclass
+class MarketPosition:
+    id: int
+    bet_id: int
+    user_id: int
+    side: WagerPick
+    shares: float
 
 
 @dataclass

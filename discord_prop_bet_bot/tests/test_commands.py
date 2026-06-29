@@ -12,9 +12,16 @@ from discord import app_commands
 
 import channel_policy as cp
 from bets import BetService
-from commands import PropBetCommands, WagerButtonView, WagerModal
+from commands import (
+    MarketBuyButtonView,
+    MarketBuyModal,
+    PropBetCommands,
+    WagerButtonView,
+    WagerModal,
+)
 from config import NO_EMOJI, YES_EMOJI
-from models import BetOutcome, BetStatus, WagerPick
+from markets import MarketService
+from models import BetKind, BetOutcome, BetStatus, WagerPick
 from tests.conftest import call_slash, make_interaction
 
 BOOKIE_ID = 99
@@ -207,11 +214,13 @@ async def test_bet_create_validation_paths(cog, db):
 
     interaction = make_interaction()
     await call_slash(cog, cog.bet_create, interaction, "Q?", "2h", -1.0, 2.0)
-    interaction.response.send_message.assert_awaited_once()
+    interaction.response.defer.assert_awaited_once()
+    interaction.followup.send.assert_awaited_once()
 
     interaction = make_interaction()
     await call_slash(cog, cog.bet_create, interaction, "Q?", "bad", 1.5, 2.0)
-    interaction.response.send_message.assert_awaited_once()
+    interaction.response.defer.assert_awaited_once()
+    interaction.followup.send.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -496,3 +505,140 @@ async def test_on_raw_reaction_remove_ignores_non_matching(cog, db):
         emoji=YES_EMOJI,
     )
     await cog.on_raw_reaction_remove(payload)
+
+
+async def _open_market(db, *, creator_id=BOOKIE_ID, hours=2, message_id=4242):
+    service = MarketService(db)
+    close = datetime.now(timezone.utc) + timedelta(hours=hours)
+    bet = await service.create_market(
+        guild_id=1,
+        channel_id=CHANNEL_ID,
+        creator_id=creator_id,
+        question="Market question?",
+        close_time=close,
+    )
+    if message_id is not None:
+        await db.set_bet_message_id(bet.id, message_id)
+    return bet.id
+
+
+@pytest.mark.asyncio
+async def test_market_create_validation_and_success(cog, db, bot_mock):
+    interaction = make_interaction(guild=False)
+    await call_slash(cog, cog.market_create, interaction, "Q?", "2h")
+    interaction.response.send_message.assert_awaited_once()
+
+    interaction = make_interaction(user_id=BOOKIE_ID)
+    message = MagicMock()
+    message.id = 7777
+    message.add_reaction = AsyncMock()
+    interaction.original_response = AsyncMock(return_value=message)
+    await call_slash(cog, cog.market_create, interaction, "Will it rain?", "2h")
+    interaction.response.defer.assert_awaited_once()
+    bot_mock.track_open_bet.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_market_buy_modal(cog, db, bot_mock):
+    bet_id = await _open_market(db)
+    await db.ensure_user(1, BETTOR_ID)
+    modal = MarketBuyModal(cog.bot, bet_id, WagerPick.YES, 1)
+    modal.amount_input = MagicMock()
+    modal.amount_input.value = "50"
+    interaction = AsyncMock()
+    interaction.user.id = BETTOR_ID
+    await modal.on_submit(interaction)
+    interaction.response.send_message.assert_awaited_once()
+    bot_mock.refresh_bet_message.assert_awaited_once_with(bet_id)
+
+
+@pytest.mark.asyncio
+async def test_market_sell_and_status(cog, db, bot_mock):
+    bet_id = await _open_market(db)
+    await db.ensure_user(1, BETTOR_ID)
+    svc = MarketService(db)
+    await svc.buy_shares(1, bet_id, BETTOR_ID, WagerPick.YES, 50)
+    pos = await db.get_market_position(bet_id, BETTOR_ID, WagerPick.YES)
+    assert pos is not None
+
+    interaction = make_interaction(user_id=BETTOR_ID)
+    await call_slash(
+        cog,
+        cog.market_sell,
+        interaction,
+        bet_id,
+        app_commands.Choice(name="YES", value="yes"),
+        pos.shares / 2,
+    )
+    interaction.response.defer.assert_awaited_once()
+    bot_mock.refresh_bet_message.assert_awaited()
+
+    interaction = make_interaction()
+    await call_slash(cog, cog.market_status, interaction, bet_id)
+    interaction.followup.send.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_market_resolve_and_cancel_paths(cog, db, bot_mock):
+    bet_id = await _open_market(db)
+    interaction = make_interaction(user_id=BETTOR_ID)
+    await call_slash(
+        cog,
+        cog.market_resolve,
+        interaction,
+        bet_id,
+        app_commands.Choice(name="YES", value="yes"),
+    )
+    interaction.followup.send.assert_awaited_once()
+
+    await db.update_bet_status(bet_id, BetStatus.CLOSED)
+    interaction = make_interaction(user_id=BOOKIE_ID)
+    cog._get_bet_message = AsyncMock(return_value=None)
+    await call_slash(
+        cog,
+        cog.market_resolve,
+        interaction,
+        bet_id,
+        app_commands.Choice(name="YES", value="yes"),
+    )
+    interaction.followup.send.assert_awaited()
+
+    bet_id = await _open_market(db)
+    interaction = make_interaction(user_id=BOOKIE_ID)
+    await call_slash(cog, cog.market_cancel, interaction, bet_id)
+    interaction.followup.send.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_bet_commands_redirect_for_markets(cog, db):
+    bet_id = await _open_market(db)
+    interaction = make_interaction(user_id=BOOKIE_ID)
+    await call_slash(
+        cog,
+        cog.bet_resolve,
+        interaction,
+        bet_id,
+        app_commands.Choice(name="YES", value="yes"),
+    )
+    interaction.followup.send.assert_awaited_once()
+
+    interaction = make_interaction(user_id=BOOKIE_ID)
+    await call_slash(cog, cog.bet_cancel, interaction, bet_id)
+    interaction.followup.send.assert_awaited_once()
+
+    interaction = make_interaction()
+    await call_slash(cog, cog.bet_status, interaction, bet_id)
+    interaction.followup.send.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_market_reaction_remove_is_noop(cog, db, bot_mock):
+    bet_id = await _open_market(db)
+    payload = SimpleNamespace(
+        user_id=BETTOR_ID,
+        channel_id=CHANNEL_ID,
+        message_id=4242,
+        emoji=YES_EMOJI,
+    )
+    await cog.on_raw_reaction_remove(payload)
+    bot_mock.refresh_bet_message.assert_not_called()

@@ -7,7 +7,13 @@ from datetime import datetime, timedelta, timezone
 
 import discord
 
-from config import ALLOWED_CHANNEL_ID, NO_EMOJI, STARTING_BALANCE, YES_EMOJI
+from config import (
+    ALLOWED_CHANNEL_ID,
+    MAX_MARKET_TRADE_COINS,
+    NO_EMOJI,
+    STARTING_BALANCE,
+    YES_EMOJI,
+)
 from database import Database
 from models import Bet, BetOutcome, BetStatus, UserBalance, Wager, WagerPick
 
@@ -393,15 +399,29 @@ def build_help_embed() -> discord.Embed:
         name="Commands",
         value=(
             "`/balance` — your coin balance\n"
-            "`/bet_create` — open a new bet (you are the bookie)\n"
-            "`/bet_status bet_id` — bet details and participants\n"
-            "`/bet_resolve bet_id outcome` — settle a bet (creator or admin)\n"
-            "`/bet_cancel bet_id` — cancel and refund all wagers (creator or admin)\n"
+            "`/bet_create` — open a prop bet (you are the bookie)\n"
+            "`/market_create` — open a Polymarket-style prediction market\n"
+            "`/bet_status` / `/market_status` — details and participants\n"
+            "`/bet_resolve` / `/market_resolve` — settle (creator or admin)\n"
+            "`/bet_cancel` / `/market_cancel` — cancel and refund\n"
+            "`/market_sell` — sell prediction-market shares before close\n"
             "`/my_bets` — your recent and active bets\n"
             "`/leaderboard` — top balances in this server\n"
             "`/reset` — bail out to starting cash (adds anti-prestige ↩️)\n"
             "`/redeem` — pay 2× starting balance to clear one ↩️\n"
             "`/help` — show this guide"
+        ),
+        inline=False,
+    )
+
+    embed.add_field(
+        name="Prediction markets (Polymarket-style)",
+        value=(
+            "`/market_create question:\"Will X happen?\" duration:2h`\n"
+            "Prices move with demand — react ✅/❌ to **buy** shares at the current price.\n"
+            f"Max **{MAX_MARKET_TRADE_COINS}** coins per buy. Each winning share pays **1 coin** "
+            "at resolution. Sell early with `/market_sell`.\n"
+            "No bookie needed — the market uses automated LMSR pricing."
         ),
         inline=False,
     )

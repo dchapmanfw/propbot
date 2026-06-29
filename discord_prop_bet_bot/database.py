@@ -11,7 +11,16 @@ from typing import Any, AsyncIterator
 import aiosqlite
 
 from config import DATABASE_PATH, STARTING_BALANCE
-from models import Bet, BetOutcome, BetStatus, UserBalance, Wager, WagerPick
+from models import (
+    Bet,
+    BetKind,
+    BetOutcome,
+    BetStatus,
+    MarketPosition,
+    UserBalance,
+    Wager,
+    WagerPick,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +62,18 @@ CREATE TABLE IF NOT EXISTS wagers (
 CREATE INDEX IF NOT EXISTS idx_bets_status ON bets(status);
 CREATE INDEX IF NOT EXISTS idx_bets_guild ON bets(guild_id);
 CREATE INDEX IF NOT EXISTS idx_wagers_bet ON wagers(bet_id);
+
+CREATE TABLE IF NOT EXISTS market_positions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    bet_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL,
+    side TEXT NOT NULL,
+    shares REAL NOT NULL DEFAULT 0,
+    FOREIGN KEY (bet_id) REFERENCES bets(id) ON DELETE CASCADE,
+    UNIQUE (bet_id, user_id, side)
+);
+
+CREATE INDEX IF NOT EXISTS idx_market_positions_bet ON market_positions(bet_id);
 """
 
 
@@ -62,6 +83,7 @@ def _parse_dt(value: str) -> datetime:
 
 def _row_to_bet(row: aiosqlite.Row) -> Bet:
     keys = row.keys()
+    bet_kind = BetKind(row["bet_kind"]) if "bet_kind" in keys else BetKind.PROP
     return Bet(
         id=row["id"],
         guild_id=row["guild_id"],
@@ -77,6 +99,10 @@ def _row_to_bet(row: aiosqlite.Row) -> Bet:
         created_at=_parse_dt(row["created_at"]),
         escrow_balance=int(row["escrow_balance"]) if "escrow_balance" in keys else 0,
         bookie_reserve=int(row["bookie_reserve"]) if "bookie_reserve" in keys else 0,
+        bet_kind=bet_kind,
+        q_yes=float(row["q_yes"]) if "q_yes" in keys else 0.0,
+        q_no=float(row["q_no"]) if "q_no" in keys else 0.0,
+        liquidity_b=float(row["liquidity_b"]) if "liquidity_b" in keys else 100.0,
     )
 
 
@@ -98,6 +124,16 @@ def _row_to_wager(row: aiosqlite.Row) -> Wager:
         user_id=row["user_id"],
         pick=WagerPick(row["pick"]),
         amount=row["amount"],
+    )
+
+
+def _row_to_market_position(row: aiosqlite.Row) -> MarketPosition:
+    return MarketPosition(
+        id=row["id"],
+        bet_id=row["bet_id"],
+        user_id=row["user_id"],
+        side=WagerPick(row["side"]),
+        shares=float(row["shares"]),
     )
 
 
@@ -137,6 +173,43 @@ class Database:
             await self.conn.execute(
                 "ALTER TABLE users ADD COLUMN reset_count INTEGER NOT NULL DEFAULT 0"
             )
+
+        if "bet_kind" not in columns:
+            await self.conn.execute(
+                "ALTER TABLE bets ADD COLUMN bet_kind TEXT NOT NULL DEFAULT 'prop'"
+            )
+        if "q_yes" not in columns:
+            await self.conn.execute(
+                "ALTER TABLE bets ADD COLUMN q_yes REAL NOT NULL DEFAULT 0"
+            )
+        if "q_no" not in columns:
+            await self.conn.execute(
+                "ALTER TABLE bets ADD COLUMN q_no REAL NOT NULL DEFAULT 0"
+            )
+        if "liquidity_b" not in columns:
+            await self.conn.execute(
+                "ALTER TABLE bets ADD COLUMN liquidity_b REAL NOT NULL DEFAULT 100"
+            )
+
+        await self.conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS market_positions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                bet_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                side TEXT NOT NULL,
+                shares REAL NOT NULL DEFAULT 0,
+                FOREIGN KEY (bet_id) REFERENCES bets(id) ON DELETE CASCADE,
+                UNIQUE (bet_id, user_id, side)
+            )
+            """
+        )
+        await self.conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_market_positions_bet
+            ON market_positions(bet_id)
+            """
+        )
 
     async def close(self) -> None:
         if self._conn:
@@ -285,14 +358,34 @@ class Database:
         cursor = await self.conn.execute(
             """
             SELECT 1
-            FROM bets
-            WHERE guild_id = ? AND creator_id = ?
-              AND status IN (?, ?)
+            FROM market_positions mp
+            JOIN bets b ON b.id = mp.bet_id
+            WHERE b.guild_id = ? AND mp.user_id = ? AND mp.shares > 0
+              AND b.status IN (?, ?)
             LIMIT 1
             """,
             (
                 guild_id,
                 user_id,
+                BetStatus.OPEN.value,
+                BetStatus.CLOSED.value,
+            ),
+        )
+        if await cursor.fetchone():
+            return True
+
+        cursor = await self.conn.execute(
+            """
+            SELECT 1
+            FROM bets
+            WHERE guild_id = ? AND creator_id = ?
+              AND bet_kind = ? AND status IN (?, ?)
+            LIMIT 1
+            """,
+            (
+                guild_id,
+                user_id,
+                BetKind.PROP.value,
                 BetStatus.OPEN.value,
                 BetStatus.CLOSED.value,
             ),
@@ -399,6 +492,135 @@ class Database:
         bet = await self.get_bet(bet_id)
         assert bet is not None
         return bet
+
+    async def create_market(
+        self,
+        guild_id: int,
+        channel_id: int,
+        creator_id: int,
+        question: str,
+        close_time: datetime,
+        liquidity_b: float,
+        initial_escrow: int,
+    ) -> Bet:
+        """Create a Polymarket-style prediction market with LMSR pricing."""
+        now = datetime.now(timezone.utc)
+        cursor = await self.conn.execute(
+            """
+            INSERT INTO bets (
+                guild_id, channel_id, creator_id, question,
+                close_time, yes_odds, no_odds, status, created_at,
+                bet_kind, liquidity_b, escrow_balance
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                guild_id,
+                channel_id,
+                creator_id,
+                question,
+                close_time.isoformat(),
+                1.0,
+                1.0,
+                BetStatus.OPEN.value,
+                now.isoformat(),
+                BetKind.MARKET.value,
+                liquidity_b,
+                initial_escrow,
+            ),
+        )
+        await self.conn.commit()
+        bet_id = cursor.lastrowid
+        bet = await self.get_bet(bet_id)
+        assert bet is not None
+        return bet
+
+    async def set_market_state(
+        self,
+        bet_id: int,
+        q_yes: float,
+        q_no: float,
+        escrow_balance: int,
+        *,
+        commit: bool = True,
+    ) -> None:
+        await self.conn.execute(
+            """
+            UPDATE bets
+            SET q_yes = ?, q_no = ?, escrow_balance = ?
+            WHERE id = ?
+            """,
+            (q_yes, q_no, escrow_balance, bet_id),
+        )
+        await self._commit_if(commit)
+
+    async def get_market_position(
+        self, bet_id: int, user_id: int, side: WagerPick
+    ) -> MarketPosition | None:
+        cursor = await self.conn.execute(
+            """
+            SELECT * FROM market_positions
+            WHERE bet_id = ? AND user_id = ? AND side = ?
+            """,
+            (bet_id, user_id, side.value),
+        )
+        row = await cursor.fetchone()
+        return _row_to_market_position(row) if row else None
+
+    async def get_market_positions_for_bet(self, bet_id: int) -> list[MarketPosition]:
+        cursor = await self.conn.execute(
+            """
+            SELECT * FROM market_positions
+            WHERE bet_id = ? AND shares > 0
+            ORDER BY shares DESC
+            """,
+            (bet_id,),
+        )
+        rows = await cursor.fetchall()
+        return [_row_to_market_position(row) for row in rows]
+
+    async def get_user_market_positions(
+        self, bet_id: int, user_id: int
+    ) -> list[MarketPosition]:
+        cursor = await self.conn.execute(
+            """
+            SELECT * FROM market_positions
+            WHERE bet_id = ? AND user_id = ? AND shares > 0
+            """,
+            (bet_id, user_id),
+        )
+        rows = await cursor.fetchall()
+        return [_row_to_market_position(row) for row in rows]
+
+    async def upsert_market_position(
+        self,
+        bet_id: int,
+        user_id: int,
+        side: WagerPick,
+        shares: float,
+        *,
+        commit: bool = True,
+    ) -> MarketPosition:
+        await self.conn.execute(
+            """
+            INSERT INTO market_positions (bet_id, user_id, side, shares)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(bet_id, user_id, side) DO UPDATE SET
+                shares = excluded.shares
+            """,
+            (bet_id, user_id, side.value, shares),
+        )
+        await self._commit_if(commit)
+        position = await self.get_market_position(bet_id, user_id, side)
+        assert position is not None
+        return position
+
+    async def remove_all_market_positions_for_bet(
+        self, bet_id: int, *, commit: bool = True
+    ) -> None:
+        await self.conn.execute(
+            "DELETE FROM market_positions WHERE bet_id = ?", (bet_id,)
+        )
+        await self._commit_if(commit)
 
     async def set_bet_message_id(self, bet_id: int, message_id: int) -> None:
         await self.conn.execute(
@@ -601,11 +823,17 @@ class Database:
             SELECT DISTINCT b.*
             FROM bets b
             LEFT JOIN wagers w ON w.bet_id = b.id
-            WHERE b.guild_id = ? AND (b.creator_id = ? OR w.user_id = ?)
+            LEFT JOIN market_positions mp ON mp.bet_id = b.id
+            WHERE b.guild_id = ?
+              AND (
+                b.creator_id = ?
+                OR w.user_id = ?
+                OR (mp.user_id = ? AND mp.shares > 0)
+              )
             ORDER BY b.created_at DESC
             LIMIT ?
             """,
-            (guild_id, user_id, user_id, limit),
+            (guild_id, user_id, user_id, user_id, limit),
         )
         rows = await cursor.fetchall()
         return [_row_to_bet(row) for row in rows]

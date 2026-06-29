@@ -19,6 +19,24 @@ BET_EXPIRY_CHECK_INTERVAL: int = int(os.getenv("BET_EXPIRY_CHECK_INTERVAL", "30"
 # Grace period after close_time before unresolved closed bets are auto-refunded (e.g. 24h).
 UNRESOLVED_REFUND_AFTER: str = os.getenv("UNRESOLVED_REFUND_AFTER", "24h")
 
+# LMSR liquidity parameter for prediction markets (higher = more stable prices).
+DEFAULT_MARKET_LIQUIDITY: float = float(os.getenv("DEFAULT_MARKET_LIQUIDITY", "100"))
+
+# Maximum coins spendable on a single prediction-market buy.
+MAX_MARKET_TRADE_COINS: int = int(os.getenv("MAX_MARKET_TRADE_COINS", "50"))
+
+# Optional: sync slash commands to one server for instant updates during development.
+_dev_guild_raw = os.getenv("DEV_GUILD_ID", "").strip()
+if _dev_guild_raw:
+    try:
+        DEV_GUILD_ID: int | None = int(_dev_guild_raw)
+    except ValueError as exc:
+        raise SystemExit(
+            f"DEV_GUILD_ID must be a numeric Discord server ID, got {_dev_guild_raw!r}"
+        ) from exc
+else:
+    DEV_GUILD_ID = None
+
 # Optional: restrict all bot commands and reactions to this channel ID (right-click channel → Copy Channel ID).
 _allowed_channel_raw = os.getenv("ALLOWED_CHANNEL_ID", "").strip()
 if _allowed_channel_raw:

@@ -24,10 +24,12 @@ from bets import (
     pick_from_emoji,
 )
 from channel_policy import allowed_channel_message, is_allowed_channel
-from config import ALLOWED_CHANNEL_ID, NO_EMOJI, YES_EMOJI
+from config import ALLOWED_CHANNEL_ID, MAX_MARKET_TRADE_COINS, NO_EMOJI, YES_EMOJI
 from database import Database
 from economy import EconomyService, REDEMPTION_COST
-from models import BetOutcome, BetStatus, WagerPick
+from lmsr import format_price_cents, lmsr_price_no, lmsr_price_yes
+from markets import MarketService, build_market_embed, format_shares
+from models import BetKind, BetOutcome, BetStatus, WagerPick
 
 if TYPE_CHECKING:
     from bot import PropBetBot
@@ -91,6 +93,97 @@ class WagerModal(discord.ui.Modal, title="Enter your wager"):
 
         await self.bot.refresh_bet_message(self.bet_id)
         self.bot._wager_prompt_at.pop((interaction.user.id, self.bet_id), None)
+
+
+class MarketBuyModal(discord.ui.Modal, title="Buy shares"):
+    """Modal for spending coins to buy prediction-market shares."""
+
+    amount_input = discord.ui.TextInput(
+        label="Coins to spend",
+        placeholder=f"1–{MAX_MARKET_TRADE_COINS} coins",
+        min_length=1,
+        max_length=10,
+    )
+
+    def __init__(
+        self,
+        bot: PropBetBot,
+        bet_id: int,
+        pick: WagerPick,
+        guild_id: int,
+    ) -> None:
+        super().__init__()
+        self.bot = bot
+        self.bet_id = bet_id
+        self.pick = pick
+        self.guild_id = guild_id
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        try:
+            amount = int(self.amount_input.value.strip())
+        except ValueError:
+            await interaction.response.send_message(
+                "Please enter a valid positive integer.", ephemeral=True
+            )
+            return
+
+        service = MarketService(self.bot.db)
+        try:
+            position, balance, shares = await service.buy_shares(
+                self.guild_id,
+                self.bet_id,
+                interaction.user.id,
+                self.pick,
+                amount,
+            )
+        except ValueError as exc:
+            await interaction.response.send_message(str(exc), ephemeral=True)
+            return
+
+        await interaction.response.send_message(
+            f"Bought **{format_shares(shares)}** {self.pick.value.upper()} shares "
+            f"on market #{self.bet_id} (holding **{format_shares(position.shares)}**). "
+            f"Remaining balance: **{balance}**.",
+            ephemeral=True,
+        )
+
+        await self.bot.refresh_bet_message(self.bet_id)
+        self.bot._wager_prompt_at.pop((interaction.user.id, self.bet_id), None)
+
+
+class MarketBuyButtonView(discord.ui.View):
+    """Button that opens the market buy modal."""
+
+    def __init__(
+        self,
+        bot: PropBetBot,
+        bet_id: int,
+        pick: WagerPick,
+        guild_id: int,
+        owner_id: int,
+    ) -> None:
+        super().__init__(timeout=300)
+        self.bot = bot
+        self.bet_id = bet_id
+        self.pick = pick
+        self.guild_id = guild_id
+        self.owner_id = owner_id
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message(
+                "This button is not for you.", ephemeral=True
+            )
+            return False
+        return True
+
+    @discord.ui.button(label="Buy shares", style=discord.ButtonStyle.primary)
+    async def buy_shares(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        await interaction.response.send_modal(
+            MarketBuyModal(self.bot, self.bet_id, self.pick, self.guild_id)
+        )
 
 
 class WagerButtonView(discord.ui.View):
@@ -208,8 +301,15 @@ class PropBetCommands(commands.Cog):
             return
 
         if datetime.now(timezone.utc) >= bet.close_time:
-            await BetService(self.db).close_bet(bet.id)
+            if bet.bet_kind == BetKind.MARKET:
+                await MarketService(self.db).close_market(bet.id)
+            else:
+                await BetService(self.db).close_bet(bet.id)
             await self.bot.refresh_bet_message(bet.id)
+            return
+
+        if bet.bet_kind == BetKind.MARKET:
+            await self._maybe_prompt_market_buy(bet, user_id, pick, channel_id)
             return
 
         if user_id == bet.creator_id:
@@ -250,6 +350,41 @@ class PropBetCommands(commands.Cog):
             delete_after=120,
         )
 
+    async def _maybe_prompt_market_buy(
+        self,
+        bet,
+        user_id: int,
+        pick: WagerPick,
+        channel_id: int,
+    ) -> None:
+        if not self._should_prompt_wager(user_id, bet.id):
+            return
+
+        await self.db.ensure_user(bet.guild_id, user_id)
+        balance = await self.db.get_balance(bet.guild_id, user_id) or 0
+        yes_price = lmsr_price_yes(bet.q_yes, bet.q_no, bet.liquidity_b)
+        no_price = lmsr_price_no(bet.q_yes, bet.q_no, bet.liquidity_b)
+        price = yes_price if pick == WagerPick.YES else no_price
+
+        user = self.bot.get_user(user_id) or await self.bot.fetch_user(user_id)
+        view = MarketBuyButtonView(
+            self.bot, bet.id, pick, bet.guild_id, owner_id=user_id
+        )
+        prompt = (
+            f"You're buying **{pick.value.upper()}** shares on market **#{bet.id}**.\n"
+            f"Current price: **{format_price_cents(price)}** · "
+            f"Balance: **{balance}** coins · "
+            f"max **{MAX_MARKET_TRADE_COINS}** coins per buy.\n"
+            f"Click **Buy shares** to spend coins."
+        )
+        await self._notify_user(
+            user,
+            channel_id,
+            prompt,
+            view=view,
+            delete_after=120,
+        )
+
     async def _reconcile_open_bet_reactions(self) -> None:
         """Prompt users who reacted while the bot was offline."""
         open_bets = await self.db.get_open_bets()
@@ -280,7 +415,9 @@ class PropBetCommands(commands.Cog):
                 if not pick:
                     continue
                 async for user in reaction.users():
-                    if user.bot or user.id == bet.creator_id:
+                    if user.bot:
+                        continue
+                    if bet.bet_kind == BetKind.PROP and user.id == bet.creator_id:
                         continue
                     await self._maybe_prompt_wager_for_reaction(
                         bet, user.id, pick, bet.channel_id
@@ -291,7 +428,22 @@ class PropBetCommands(commands.Cog):
         if self._reactions_reconciled:
             return
         self._reactions_reconciled = True
-        await self._reconcile_open_bet_reactions()
+        self.bot.loop.create_task(self._reconcile_open_bet_reactions())
+
+    async def _defer(
+        self, interaction: discord.Interaction, *, ephemeral: bool = False
+    ) -> bool:
+        """Acknowledge the interaction within Discord's 3-second window."""
+        try:
+            await interaction.response.defer(ephemeral=ephemeral)
+            return True
+        except discord.NotFound:
+            logger.warning(
+                "Could not acknowledge slash command (interaction expired or already "
+                "handled). If commands fail repeatedly, run .\\kill_bot.ps1 to stop "
+                "duplicate bot processes."
+            )
+            return False
 
     async def _is_admin_or_creator(
         self, interaction: discord.Interaction, bet_creator_id: int
@@ -303,13 +455,17 @@ class PropBetCommands(commands.Cog):
         perms = interaction.user.guild_permissions
         return bool(perms.administrator or perms.manage_guild)
 
-    async def _require_allowed_channel(self, interaction: discord.Interaction) -> bool:
+    async def _require_allowed_channel(
+        self, interaction: discord.Interaction, *, use_followup: bool = False
+    ) -> bool:
         """Reject slash commands used outside the configured betting channel."""
         if is_allowed_channel(interaction.channel_id):
             return True
-        await interaction.response.send_message(
-            allowed_channel_message(), ephemeral=True
-        )
+        msg = allowed_channel_message()
+        if use_followup:
+            await interaction.followup.send(msg, ephemeral=True)
+        else:
+            await interaction.response.send_message(msg, ephemeral=True)
         return False
 
     @app_commands.command(name="help", description="How to use the prop bet bot")
@@ -340,10 +496,10 @@ class PropBetCommands(commands.Cog):
                 "This command can only be used in a server.", ephemeral=True
             )
             return
-        if not await self._require_allowed_channel(interaction):
+        if not await self._defer(interaction, ephemeral=True):
             return
-
-        await interaction.response.defer(ephemeral=True)
+        if not await self._require_allowed_channel(interaction, use_followup=True):
+            return
 
         user = await self.db.ensure_user(interaction.guild.id, interaction.user.id)
         await interaction.followup.send(format_balance_message(user))
@@ -358,10 +514,10 @@ class PropBetCommands(commands.Cog):
                 "This command can only be used in a server.", ephemeral=True
             )
             return
-        if not await self._require_allowed_channel(interaction):
+        if not await self._defer(interaction, ephemeral=True):
             return
-
-        await interaction.response.defer(ephemeral=True)
+        if not await self._require_allowed_channel(interaction, use_followup=True):
+            return
 
         service = EconomyService(self.db)
         try:
@@ -387,10 +543,10 @@ class PropBetCommands(commands.Cog):
                 "This command can only be used in a server.", ephemeral=True
             )
             return
-        if not await self._require_allowed_channel(interaction):
+        if not await self._defer(interaction, ephemeral=True):
             return
-
-        await interaction.response.defer(ephemeral=True)
+        if not await self._require_allowed_channel(interaction, use_followup=True):
+            return
 
         service = EconomyService(self.db)
         try:
@@ -434,11 +590,13 @@ class PropBetCommands(commands.Cog):
                 "This command can only be used in a server channel.", ephemeral=True
             )
             return
-        if not await self._require_allowed_channel(interaction):
+        if not await self._defer(interaction):
+            return
+        if not await self._require_allowed_channel(interaction, use_followup=True):
             return
 
         if yes_odds <= 0 or no_odds <= 0:
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 "Odds must be positive numbers.", ephemeral=True
             )
             return
@@ -446,10 +604,8 @@ class PropBetCommands(commands.Cog):
         try:
             delta = parse_duration(duration)
         except DurationParseError as exc:
-            await interaction.response.send_message(str(exc), ephemeral=True)
+            await interaction.followup.send(str(exc), ephemeral=True)
             return
-
-        await interaction.response.defer()
 
         close_time = datetime.now(timezone.utc) + delta
         await self.db.ensure_user(interaction.guild.id, interaction.user.id)
@@ -504,6 +660,330 @@ class PropBetCommands(commands.Cog):
         assert bet is not None
         self.bot.track_open_bet(bet)
 
+    @app_commands.command(
+        name="market_create",
+        description="Create a Polymarket-style prediction market",
+    )
+    @app_commands.describe(
+        question="The yes/no question the market resolves on",
+        duration="How long trading stays open (e.g. 2h, 30m, 1d)",
+    )
+    async def market_create(
+        self,
+        interaction: discord.Interaction,
+        question: str,
+        duration: str,
+    ) -> None:
+        if not interaction.guild or not interaction.channel:
+            await interaction.response.send_message(
+                "This command can only be used in a server channel.", ephemeral=True
+            )
+            return
+        if not await self._defer(interaction):
+            return
+        if not await self._require_allowed_channel(interaction, use_followup=True):
+            return
+
+        try:
+            delta = parse_duration(duration)
+        except DurationParseError as exc:
+            await interaction.followup.send(str(exc), ephemeral=True)
+            return
+
+        close_time = datetime.now(timezone.utc) + delta
+        await self.db.ensure_user(interaction.guild.id, interaction.user.id)
+
+        service = MarketService(self.db)
+        try:
+            bet = await service.create_market(
+                guild_id=interaction.guild.id,
+                channel_id=interaction.channel.id,
+                creator_id=interaction.user.id,
+                question=question,
+                close_time=close_time,
+            )
+        except ValueError as exc:
+            await interaction.followup.send(str(exc), ephemeral=True)
+            return
+
+        embed = build_market_embed(bet, creator=interaction.user)
+        await interaction.edit_original_response(embed=embed)
+        message = await interaction.original_response()
+
+        await self.db.set_bet_message_id(bet.id, message.id)
+        try:
+            await message.add_reaction(YES_EMOJI)
+            await message.add_reaction(NO_EMOJI)
+        except discord.Forbidden:
+            logger.warning(
+                "Missing channel access to add reactions in channel %s",
+                interaction.channel.id,
+            )
+            try:
+                await MarketService(self.db).cancel_market(bet.id)
+            except ValueError:
+                pass
+            try:
+                await message.delete()
+            except discord.Forbidden:
+                pass
+            await interaction.followup.send(
+                "I posted the market but **could not add reactions** in this channel "
+                f"({interaction.channel.mention}).\n\n"
+                "Give my role **View Channel**, **Send Messages**, **Add Reactions**, "
+                "and **Read Message History** in this channel, then run `/market_create` again.",
+                ephemeral=True,
+            )
+            return
+
+        bet = await self.db.get_bet(bet.id)
+        assert bet is not None
+        self.bot.track_open_bet(bet)
+
+    @app_commands.command(
+        name="market_sell",
+        description="Sell prediction-market shares before the market closes",
+    )
+    @app_commands.describe(
+        bet_id="The market ID",
+        side="Which side's shares to sell",
+        shares="Number of shares to sell (decimals allowed)",
+    )
+    @app_commands.choices(
+        side=[
+            app_commands.Choice(name="YES", value="yes"),
+            app_commands.Choice(name="NO", value="no"),
+        ]
+    )
+    async def market_sell(
+        self,
+        interaction: discord.Interaction,
+        bet_id: int,
+        side: app_commands.Choice[str],
+        shares: float,
+    ) -> None:
+        if not interaction.guild:
+            await interaction.response.send_message(
+                "This command can only be used in a server.", ephemeral=True
+            )
+            return
+        if not await self._defer(interaction, ephemeral=True):
+            return
+        if not await self._require_allowed_channel(interaction, use_followup=True):
+            return
+
+        service = MarketService(self.db)
+        try:
+            balance, sold = await service.sell_shares(
+                interaction.guild.id,
+                bet_id,
+                interaction.user.id,
+                WagerPick(side.value),
+                shares,
+            )
+        except ValueError as exc:
+            await interaction.followup.send(str(exc))
+            return
+
+        await interaction.followup.send(
+            f"Sold **{format_shares(sold)}** {side.value.upper()} shares on "
+            f"market #{bet_id}. Balance: **{balance}** coins."
+        )
+        await self.bot.refresh_bet_message(bet_id)
+
+    @app_commands.command(
+        name="market_resolve",
+        description="Resolve a prediction market (creator or admin)",
+    )
+    @app_commands.describe(
+        bet_id="The market ID to resolve",
+        outcome="Final outcome",
+    )
+    @app_commands.choices(
+        outcome=[
+            app_commands.Choice(name="YES", value="yes"),
+            app_commands.Choice(name="NO", value="no"),
+            app_commands.Choice(name="Refund (tie / N/A)", value="refund"),
+        ]
+    )
+    async def market_resolve(
+        self,
+        interaction: discord.Interaction,
+        bet_id: int,
+        outcome: app_commands.Choice[str],
+    ) -> None:
+        if not interaction.guild:
+            await interaction.response.send_message(
+                "This command can only be used in a server.", ephemeral=True
+            )
+            return
+        if not await self._defer(interaction):
+            return
+        if not await self._require_allowed_channel(interaction, use_followup=True):
+            return
+
+        bet = await self.db.get_bet(bet_id)
+        if not bet or bet.guild_id != interaction.guild.id:
+            await interaction.followup.send("Market not found.", ephemeral=True)
+            return
+        if bet.bet_kind != BetKind.MARKET:
+            await interaction.followup.send(
+                "That ID is a prop bet — use `/bet_resolve` instead.",
+                ephemeral=True,
+            )
+            return
+
+        if not await self._is_admin_or_creator(interaction, bet.creator_id):
+            await interaction.followup.send(
+                "Only the market creator or a server admin can resolve this market.",
+                ephemeral=True,
+            )
+            return
+
+        if bet.status == BetStatus.OPEN:
+            if datetime.now(timezone.utc) >= bet.close_time:
+                await MarketService(self.db).close_market(bet_id)
+                bet = await self.db.get_bet(bet_id)
+                assert bet is not None
+            else:
+                await interaction.followup.send(
+                    "This market is still open. Wait until trading closes, then resolve.",
+                    ephemeral=True,
+                )
+                return
+
+        service = MarketService(self.db)
+        try:
+            resolved, payouts = await service.resolve_market(
+                bet_id, BetOutcome(outcome.value)
+            )
+        except ValueError as exc:
+            await interaction.followup.send(str(exc), ephemeral=True)
+            return
+
+        positions = await self.db.get_market_positions_for_bet(bet_id)
+        creator = interaction.guild.get_member(bet.creator_id)
+        embed = build_market_embed(
+            resolved,
+            creator=creator,
+            positions=positions,
+            footer_extra="Trading closed",
+        )
+
+        if outcome.value == "refund":
+            result_text = "All positions liquidated at current prices."
+        else:
+            lines = []
+            for user_id, payout, pick in payouts:
+                lines.append(
+                    f"<@{user_id}> won **{payout}** coins "
+                    f"({emoji_from_pick(pick)} shares)"
+                )
+            result_text = "\n".join(lines) if lines else "_No winning shares._"
+
+        await interaction.followup.send(
+            content=f"Market #{bet_id} resolved.\n{result_text}",
+            embed=embed,
+        )
+
+        message = await self._get_bet_message(resolved)
+        if message:
+            await message.edit(embed=embed)
+
+        self.bot.untrack_bet(bet_id)
+
+    @app_commands.command(
+        name="market_cancel",
+        description="Cancel a prediction market and liquidate all positions",
+    )
+    async def market_cancel(
+        self, interaction: discord.Interaction, bet_id: int
+    ) -> None:
+        if not interaction.guild:
+            await interaction.response.send_message(
+                "This command can only be used in a server.", ephemeral=True
+            )
+            return
+        if not await self._defer(interaction):
+            return
+        if not await self._require_allowed_channel(interaction, use_followup=True):
+            return
+
+        bet = await self.db.get_bet(bet_id)
+        if not bet or bet.guild_id != interaction.guild.id:
+            await interaction.followup.send("Market not found.", ephemeral=True)
+            return
+        if bet.bet_kind != BetKind.MARKET:
+            await interaction.followup.send(
+                "That ID is a prop bet — use `/bet_cancel` instead.",
+                ephemeral=True,
+            )
+            return
+
+        if not await self._is_admin_or_creator(interaction, bet.creator_id):
+            await interaction.followup.send(
+                "Only the market creator or a server admin can cancel this market.",
+                ephemeral=True,
+            )
+            return
+
+        service = MarketService(self.db)
+        try:
+            count = await service.cancel_market(bet_id)
+        except ValueError as exc:
+            await interaction.followup.send(str(exc), ephemeral=True)
+            return
+
+        bet = await self.db.get_bet(bet_id)
+        assert bet is not None
+        creator = interaction.guild.get_member(bet.creator_id)
+        embed = build_market_embed(
+            bet, creator=creator, footer_extra="Cancelled — positions liquidated"
+        )
+
+        await interaction.followup.send(
+            f"Market #{bet_id} cancelled. Liquidated **{count}** position(s).",
+            embed=embed,
+        )
+
+        message = await self._get_bet_message(bet)
+        if message:
+            await message.edit(embed=embed)
+
+        self.bot.untrack_bet(bet_id)
+
+    @app_commands.command(
+        name="market_status",
+        description="Show prediction market details and positions",
+    )
+    async def market_status(
+        self, interaction: discord.Interaction, bet_id: int
+    ) -> None:
+        if not interaction.guild:
+            await interaction.response.send_message(
+                "This command can only be used in a server.", ephemeral=True
+            )
+            return
+        if not await self._defer(interaction, ephemeral=True):
+            return
+        if not await self._require_allowed_channel(interaction, use_followup=True):
+            return
+
+        bet = await self.db.get_bet(bet_id)
+        if not bet or bet.guild_id != interaction.guild.id:
+            await interaction.followup.send("Market not found.")
+            return
+        if bet.bet_kind != BetKind.MARKET:
+            await interaction.followup.send(
+                "That ID is a prop bet — use `/bet_status` instead."
+            )
+            return
+
+        positions = await self.db.get_market_positions_for_bet(bet_id)
+        creator = interaction.guild.get_member(bet.creator_id)
+        embed = build_market_embed(bet, creator=creator, positions=positions)
+        await interaction.followup.send(embed=embed)
+
     @app_commands.command(name="bet_resolve", description="Resolve a bet with an outcome")
     @app_commands.describe(
         bet_id="The bet ID to resolve",
@@ -527,14 +1007,20 @@ class PropBetCommands(commands.Cog):
                 "This command can only be used in a server.", ephemeral=True
             )
             return
-        if not await self._require_allowed_channel(interaction):
+        if not await self._defer(interaction):
             return
-
-        await interaction.response.defer()
+        if not await self._require_allowed_channel(interaction, use_followup=True):
+            return
 
         bet = await self.db.get_bet(bet_id)
         if not bet or bet.guild_id != interaction.guild.id:
             await interaction.followup.send("Bet not found.", ephemeral=True)
+            return
+        if bet.bet_kind == BetKind.MARKET:
+            await interaction.followup.send(
+                "That ID is a prediction market — use `/market_resolve` instead.",
+                ephemeral=True,
+            )
             return
 
         if not await self._is_admin_or_creator(interaction, bet.creator_id):
@@ -604,14 +1090,20 @@ class PropBetCommands(commands.Cog):
                 "This command can only be used in a server.", ephemeral=True
             )
             return
-        if not await self._require_allowed_channel(interaction):
+        if not await self._defer(interaction):
             return
-
-        await interaction.response.defer()
+        if not await self._require_allowed_channel(interaction, use_followup=True):
+            return
 
         bet = await self.db.get_bet(bet_id)
         if not bet or bet.guild_id != interaction.guild.id:
             await interaction.followup.send("Bet not found.", ephemeral=True)
+            return
+        if bet.bet_kind == BetKind.MARKET:
+            await interaction.followup.send(
+                "That ID is a prediction market — use `/market_cancel` instead.",
+                ephemeral=True,
+            )
             return
 
         if not await self._is_admin_or_creator(interaction, bet.creator_id):
@@ -651,14 +1143,19 @@ class PropBetCommands(commands.Cog):
                 "This command can only be used in a server.", ephemeral=True
             )
             return
-        if not await self._require_allowed_channel(interaction):
+        if not await self._defer(interaction, ephemeral=True):
             return
-
-        await interaction.response.defer(ephemeral=True)
+        if not await self._require_allowed_channel(interaction, use_followup=True):
+            return
 
         bet = await self.db.get_bet(bet_id)
         if not bet or bet.guild_id != interaction.guild.id:
             await interaction.followup.send("Bet not found.")
+            return
+        if bet.bet_kind == BetKind.MARKET:
+            await interaction.followup.send(
+                "That ID is a prediction market — use `/market_status` instead."
+            )
             return
 
         wagers = await self.db.get_wagers_for_bet(bet_id)
@@ -683,10 +1180,10 @@ class PropBetCommands(commands.Cog):
                 "This command can only be used in a server.", ephemeral=True
             )
             return
-        if not await self._require_allowed_channel(interaction):
+        if not await self._defer(interaction, ephemeral=True):
             return
-
-        await interaction.response.defer(ephemeral=True)
+        if not await self._require_allowed_channel(interaction, use_followup=True):
+            return
 
         bets = await self.db.get_user_bets(interaction.guild.id, interaction.user.id)
         if not bets:
@@ -697,13 +1194,25 @@ class PropBetCommands(commands.Cog):
 
         lines = []
         for bet in bets:
+            kind = "market" if bet.bet_kind == BetKind.MARKET else "prop"
             wager = await self.db.get_wager(bet.id, interaction.user.id)
+            positions = await self.db.get_user_market_positions(
+                bet.id, interaction.user.id
+            )
             extra = ""
             if wager:
                 extra = f" — your wager: {emoji_from_pick(wager.pick)} {wager.amount}"
+            elif positions:
+                parts = []
+                for pos in positions:
+                    emoji = emoji_from_pick(pos.side)
+                    parts.append(f"{emoji} {format_shares(pos.shares)}")
+                extra = f" — your shares: {' · '.join(parts)}"
             elif bet.creator_id == interaction.user.id:
-                extra = " — you created this bet"
-            lines.append(f"**#{bet.id}** [{bet.status.value}] {bet.question}{extra}")
+                extra = " — you created this"
+            lines.append(
+                f"**#{bet.id}** [{kind}/{bet.status.value}] {bet.question}{extra}"
+            )
 
         embed = discord.Embed(
             title="Your bets",
@@ -719,10 +1228,10 @@ class PropBetCommands(commands.Cog):
                 "This command can only be used in a server.", ephemeral=True
             )
             return
-        if not await self._require_allowed_channel(interaction):
+        if not await self._defer(interaction):
             return
-
-        await interaction.response.defer()
+        if not await self._require_allowed_channel(interaction, use_followup=True):
+            return
 
         rows = await self.db.get_leaderboard(interaction.guild.id, limit=10)
         if not rows:
@@ -785,6 +1294,8 @@ class PropBetCommands(commands.Cog):
 
         bet = await self.db.get_bet_by_message(payload.message_id)
         if not bet or bet.status != BetStatus.OPEN:
+            return
+        if bet.bet_kind == BetKind.MARKET:
             return
 
         existing = await self.db.get_wager(bet.id, payload.user_id)

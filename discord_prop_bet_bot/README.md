@@ -105,9 +105,11 @@ await self.tree.sync(guild=discord.Object(id=YOUR_GUILD_ID))
 |---|---|
 | `/balance` | Your current coin balance |
 | `/bet_create` | Create a new prop bet |
-| `/bet_resolve` | Resolve a bet (creator or admin) |
-| `/bet_cancel` | Cancel and refund an unresolved bet |
-| `/bet_status` | Bet details and participants |
+| `/market_create` | Create a Polymarket-style prediction market |
+| `/market_sell` | Sell market shares before close |
+| `/bet_resolve` / `/market_resolve` | Resolve a bet or market (creator or admin) |
+| `/bet_cancel` / `/market_cancel` | Cancel and refund |
+| `/bet_status` / `/market_status` | Bet or market details |
 | `/my_bets` | Your recent / active bets |
 | `/leaderboard` | Top balances in the server |
 
@@ -123,6 +125,18 @@ await self.tree.sync(guild=discord.Object(id=YOUR_GUILD_ID))
 
 ```
 /balance
+```
+
+**Create a prediction market**
+
+```
+/market_create question:"Will Team A win tonight?" duration:2h
+```
+
+**Sell shares before close**
+
+```
+/market_sell bet_id:2 side:YES shares:12.5
 ```
 
 **Resolve (creator or admin)**
@@ -149,6 +163,8 @@ await self.tree.sync(guild=discord.Object(id=YOUR_GUILD_ID))
 
 ## How betting works
 
+### Prop bets (bookie model)
+
 1. Someone runs `/bet_create` — the bot posts an embed with ✅ and ❌ reactions.
 2. Users react with their pick. The bot DMs them (or posts a button in-channel) to enter a wager.
 3. Wagers are deducted immediately from the user's server balance.
@@ -159,6 +175,16 @@ await self.tree.sync(guild=discord.Object(id=YOUR_GUILD_ID))
    - **Winners** receive `wager × odds`
    - **Losers** keep their wager lost
    - **Refund** returns everyone's wager (tie / N/A)
+
+### Prediction markets (Polymarket-style)
+
+1. Someone runs `/market_create` — prices start at **50¢ YES / 50¢ NO**.
+2. Users react ✅ or ❌ to **buy shares** at the current LMSR price (like Polymarket).
+3. Prices move with demand — more YES buying pushes YES price up.
+4. Sell anytime before close with `/market_sell`.
+5. When trading closes, the creator (or admin) runs `/market_resolve`.
+6. Each **winning share pays 1 coin** (e.g. bought YES at 60¢, resolved YES → 40¢ profit per share).
+7. No bookie — the market pool uses automated pricing (LMSR).
 
 ## Project structure
 

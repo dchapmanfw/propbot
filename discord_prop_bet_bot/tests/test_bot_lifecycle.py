@@ -142,6 +142,33 @@ async def test_refresh_bet_message_edits_embed(bot, db):
 
 
 @pytest.mark.asyncio
+async def test_refresh_market_message_edits_embed(bot, db):
+    from markets import MarketService
+
+    service = MarketService(db)
+    bet = await service.create_market(
+        guild_id=1,
+        channel_id=100,
+        creator_id=99,
+        question="Rain?",
+        close_time=datetime.now(timezone.utc) + timedelta(hours=1),
+    )
+    await db.set_bet_message_id(bet.id, 4242)
+    bot.db = db
+
+    message = MagicMock()
+    message.edit = AsyncMock()
+    channel = MagicMock()
+    channel.fetch_message = AsyncMock(return_value=message)
+    channel.guild = MagicMock()
+    channel.guild.get_member = MagicMock(return_value=None)
+    bot.fetch_channel = AsyncMock(return_value=channel)
+
+    await bot.refresh_bet_message(bet.id)
+    message.edit.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_refresh_bet_message_handles_not_found(bot, db):
     bet = await db.create_bet(
         guild_id=1,

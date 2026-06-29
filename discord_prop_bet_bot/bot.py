@@ -11,11 +11,13 @@ from bets import BetService, DurationParseError, build_bet_embed, parse_duration
 from commands import PropBetCommands
 from config import (
     BET_EXPIRY_CHECK_INTERVAL,
+    DEV_GUILD_ID,
     DISCORD_TOKEN,
     UNRESOLVED_REFUND_AFTER,
 )
 from database import Database
-from models import Bet, BetStatus
+from markets import MarketService, build_market_embed
+from models import Bet, BetKind, BetStatus
 
 logging.basicConfig(
     level=logging.INFO,
@@ -48,9 +50,7 @@ class PropBetBot(commands.Bot):
         await self.db.connect()
         await self.add_cog(PropBetCommands(self))
 
-        # Sync slash commands globally (or use guild= for faster dev iteration).
-        await self.tree.sync()
-        logger.info("Slash commands synced")
+        await self._sync_slash_commands()
 
         # Resume tracking open bets after restart.
         open_bets = await self.db.get_open_bets()
@@ -60,6 +60,26 @@ class PropBetBot(commands.Bot):
 
         if not self.check_expired_bets.is_running():
             self.check_expired_bets.start()
+
+    async def _sync_slash_commands(self) -> None:
+        """Register slash commands with Discord (guild sync is instant for dev)."""
+        if DEV_GUILD_ID is not None:
+            guild = discord.Object(id=DEV_GUILD_ID)
+            # Cog commands live on the global tree — copy them before guild sync.
+            self.tree.copy_global_to(guild=guild)
+            synced = await self.tree.sync(guild=guild)
+            names = sorted(cmd.name for cmd in synced)
+            logger.info(
+                "Slash commands synced to guild %s (%d): %s",
+                DEV_GUILD_ID,
+                len(names),
+                ", ".join(names),
+            )
+            return
+
+        synced = await self.tree.sync()
+        names = sorted(cmd.name for cmd in synced)
+        logger.info("Slash commands synced globally (%d): %s", len(names), ", ".join(names))
 
     async def close(self) -> None:
         self.check_expired_bets.cancel()
@@ -107,37 +127,57 @@ class PropBetBot(commands.Bot):
 
         guild = channel.guild if hasattr(channel, "guild") else None
         creator = guild.get_member(bet.creator_id) if guild else None
-        wagers = await self.db.get_wagers_for_bet(bet_id)
-        bookie_balance = None
-        if bet.status == BetStatus.OPEN:
-            bookie_balance = await self.db.get_balance(bet.guild_id, bet.creator_id)
-        embed = build_bet_embed(
-            bet,
-            creator=creator,
-            wagers=wagers,
-            footer_extra=footer_extra,
-            bookie_balance=bookie_balance,
-        )
+
+        if bet.bet_kind == BetKind.MARKET:
+            positions = await self.db.get_market_positions_for_bet(bet_id)
+            embed = build_market_embed(
+                bet,
+                creator=creator,
+                positions=positions,
+                footer_extra=footer_extra,
+            )
+        else:
+            wagers = await self.db.get_wagers_for_bet(bet_id)
+            bookie_balance = None
+            if bet.status == BetStatus.OPEN:
+                bookie_balance = await self.db.get_balance(
+                    bet.guild_id, bet.creator_id
+                )
+            embed = build_bet_embed(
+                bet,
+                creator=creator,
+                wagers=wagers,
+                footer_extra=footer_extra,
+                bookie_balance=bookie_balance,
+            )
         await message.edit(embed=embed)
 
     @tasks.loop(seconds=BET_EXPIRY_CHECK_INTERVAL)
     async def check_expired_bets(self) -> None:
         """Close expired open bets and refund stale unresolved closed bets."""
-        service = BetService(self.db)
+        bet_service = BetService(self.db)
+        market_service = MarketService(self.db)
 
         for bet in await self.db.get_expired_open_bets():
-            closed = await service.close_bet(bet.id)
+            if bet.bet_kind == BetKind.MARKET:
+                closed = await market_service.close_market(bet.id)
+            else:
+                closed = await bet_service.close_bet(bet.id)
             if closed:
-                logger.info("Closed expired bet #%d", bet.id)
+                logger.info("Closed expired %s #%d", bet.bet_kind.value, bet.id)
                 await self.refresh_bet_message(bet.id)
                 self.untrack_bet(bet.id)
 
         for bet in await self.db.get_stale_closed_bets(self._unresolved_refund_after):
-            result = await service.refund_unresolved_bet(bet.id)
+            if bet.bet_kind == BetKind.MARKET:
+                result = await market_service.refund_unresolved_market(bet.id)
+            else:
+                result = await bet_service.refund_unresolved_bet(bet.id)
             if result:
                 refunded_bet, count = result
                 logger.info(
-                    "Auto-refunded bet #%d (%d wager(s)) — unresolved past grace period",
+                    "Auto-refunded %s #%d (%d position(s)/wager(s)) — unresolved past grace period",
+                    bet.bet_kind.value,
                     bet.id,
                     count,
                 )
