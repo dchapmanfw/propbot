@@ -33,7 +33,9 @@ CREATE TABLE IF NOT EXISTS bets (
     no_odds REAL NOT NULL,
     status TEXT NOT NULL DEFAULT 'open',
     outcome TEXT,
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    escrow_balance INTEGER NOT NULL DEFAULT 0,
+    bookie_reserve INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS wagers (
@@ -57,6 +59,7 @@ def _parse_dt(value: str) -> datetime:
 
 
 def _row_to_bet(row: aiosqlite.Row) -> Bet:
+    keys = row.keys()
     return Bet(
         id=row["id"],
         guild_id=row["guild_id"],
@@ -70,6 +73,8 @@ def _row_to_bet(row: aiosqlite.Row) -> Bet:
         status=BetStatus(row["status"]),
         outcome=BetOutcome(row["outcome"]) if row["outcome"] else None,
         created_at=_parse_dt(row["created_at"]),
+        escrow_balance=int(row["escrow_balance"]) if "escrow_balance" in keys else 0,
+        bookie_reserve=int(row["bookie_reserve"]) if "bookie_reserve" in keys else 0,
     )
 
 
@@ -95,8 +100,22 @@ class Database:
         self._conn.row_factory = aiosqlite.Row
         await self._conn.execute("PRAGMA foreign_keys = ON")
         await self._conn.executescript(SCHEMA)
+        await self._migrate_schema()
         await self._conn.commit()
         logger.info("Database initialized at %s", self.path)
+
+    async def _migrate_schema(self) -> None:
+        """Add columns introduced after initial release (idempotent)."""
+        cursor = await self.conn.execute("PRAGMA table_info(bets)")
+        columns = {row[1] for row in await cursor.fetchall()}
+        if "escrow_balance" not in columns:
+            await self.conn.execute(
+                "ALTER TABLE bets ADD COLUMN escrow_balance INTEGER NOT NULL DEFAULT 0"
+            )
+        if "bookie_reserve" not in columns:
+            await self.conn.execute(
+                "ALTER TABLE bets ADD COLUMN bookie_reserve INTEGER NOT NULL DEFAULT 0"
+            )
 
     async def close(self) -> None:
         if self._conn:
@@ -147,6 +166,37 @@ class Database:
         balance = await self.get_balance(guild_id, user_id)
         assert balance is not None
         return balance
+
+    async def adjust_balance_allow_negative(
+        self, guild_id: int, user_id: int, delta: int
+    ) -> int:
+        """Adjust balance without a floor (used for bookie settlement)."""
+        await self.ensure_user(guild_id, user_id)
+        await self.conn.execute(
+            """
+            UPDATE users
+            SET balance = balance + ?
+            WHERE guild_id = ? AND user_id = ?
+            """,
+            (delta, guild_id, user_id),
+        )
+        await self.conn.commit()
+        balance = await self.get_balance(guild_id, user_id)
+        assert balance is not None
+        return balance
+
+    async def set_bet_escrow(
+        self, bet_id: int, escrow_balance: int, bookie_reserve: int
+    ) -> None:
+        await self.conn.execute(
+            """
+            UPDATE bets
+            SET escrow_balance = ?, bookie_reserve = ?
+            WHERE id = ?
+            """,
+            (escrow_balance, bookie_reserve, bet_id),
+        )
+        await self.conn.commit()
 
     async def create_bet(
         self,

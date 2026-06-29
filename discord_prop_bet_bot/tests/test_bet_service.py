@@ -54,6 +54,8 @@ async def test_insufficient_funds_rejected(service):
     svc, db = service
     bet_id = await _open_bet(db)
     await db.ensure_user(1, 50)
+    # Ensure bookie can cover liability so the bettor is the one who fails.
+    await db.adjust_balance(1, 99, 50_000)
 
     with pytest.raises(ValueError, match="Insufficient balance"):
         await svc.place_or_update_wager(1, bet_id, 50, WagerPick.YES, 5000)
@@ -121,6 +123,7 @@ async def test_resolve_pays_winners(service):
     assert payouts[0][1] == 200  # 100 * 2.0
     assert await db.get_balance(1, 50) == STARTING_BALANCE - 100 + 200
     assert await db.get_balance(1, 51) == STARTING_BALANCE - 100
+    assert await db.get_balance(1, 99) == STARTING_BALANCE
 
 
 @pytest.mark.asyncio

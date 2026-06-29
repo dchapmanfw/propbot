@@ -44,6 +44,8 @@ class Bet:
     status: BetStatus
     outcome: BetOutcome | None
     created_at: datetime
+    escrow_balance: int = 0
+    bookie_reserve: int = 0
 
 
 @dataclass

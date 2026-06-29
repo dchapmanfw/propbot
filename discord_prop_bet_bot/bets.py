@@ -56,6 +56,47 @@ def compute_payout(wager: Wager, bet: Bet, outcome: BetOutcome) -> int:
     return 0
 
 
+def compute_bookie_reserve(
+    wagers: list[Wager], yes_odds: float, no_odds: float
+) -> tuple[int, int, int, int]:
+    """
+    Compute escrow pool size and required bookie reserve.
+
+    Reserve covers the worst-case shortfall if either side wins:
+      loss_if_YES = max(0, yes_payouts - pool)
+      loss_if_NO  = max(0, no_payouts - pool)
+      reserve     = max(loss_if_YES, loss_if_NO)
+
+    Returns (pool, yes_payout_total, no_payout_total, required_reserve).
+    """
+    pool = sum(w.amount for w in wagers)
+    yes_payout = sum(
+        int(w.amount * yes_odds) for w in wagers if w.pick == WagerPick.YES
+    )
+    no_payout = sum(
+        int(w.amount * no_odds) for w in wagers if w.pick == WagerPick.NO
+    )
+    loss_if_yes = max(0, yes_payout - pool)
+    loss_if_no = max(0, no_payout - pool)
+    required_reserve = max(loss_if_yes, loss_if_no)
+    return pool, yes_payout, no_payout, required_reserve
+
+
+def _hypothetical_wagers(
+    bet_id: int,
+    wagers: list[Wager],
+    user_id: int,
+    pick: WagerPick,
+    amount: int,
+) -> list[Wager]:
+    """Build wager list as if user_id placed/updated their position."""
+    kept = [w for w in wagers if w.user_id != user_id]
+    kept.append(
+        Wager(id=0, bet_id=bet_id, user_id=user_id, pick=pick, amount=amount)
+    )
+    return kept
+
+
 def pick_from_emoji(emoji: str) -> WagerPick | None:
     if emoji == YES_EMOJI:
         return WagerPick.YES
@@ -108,6 +149,12 @@ def build_bet_embed(
     )
     embed.add_field(name="YES odds", value=f"{bet.yes_odds:.2f}x", inline=True)
     embed.add_field(name="NO odds", value=f"{bet.no_odds:.2f}x", inline=True)
+    if bet.status in (BetStatus.OPEN, BetStatus.CLOSED):
+        embed.add_field(
+            name="Pool / reserve",
+            value=f"**{bet.escrow_balance}** in escrow · **{bet.bookie_reserve}** reserved",
+            inline=False,
+        )
 
     if bet.outcome:
         outcome_text = {
@@ -142,10 +189,25 @@ def build_bet_embed(
 
 
 class BetService:
-    """Coordinates bet lifecycle operations with balance safety."""
+    """Coordinates bet lifecycle with bookie escrow and liability reserves."""
 
     def __init__(self, db: Database) -> None:
         self.db = db
+
+    async def _apply_reserve_change(
+        self, bet: Bet, new_reserve: int, new_escrow: int
+    ) -> None:
+        """Lock or release bookie funds when reserve changes."""
+        reserve_delta = new_reserve - bet.bookie_reserve
+        if reserve_delta > 0:
+            await self.db.adjust_balance(
+                bet.guild_id, bet.creator_id, -reserve_delta
+            )
+        elif reserve_delta < 0:
+            await self.db.adjust_balance(
+                bet.guild_id, bet.creator_id, -reserve_delta
+            )
+        await self.db.set_bet_escrow(bet.id, new_escrow, new_reserve)
 
     async def place_or_update_wager(
         self,
@@ -156,8 +218,8 @@ class BetService:
         amount: int,
     ) -> tuple[Wager, int]:
         """
-        Place or update a wager, adjusting balances atomically.
-        Returns (wager, new_balance).
+        Place or update a wager. Bettor funds escrow; bookie reserve is adjusted.
+        Returns (wager, new_bettor_balance).
         """
         if amount <= 0:
             raise ValueError("Wager must be a positive integer.")
@@ -175,16 +237,30 @@ class BetService:
             raise ValueError("You cannot wager on a bet you created.")
 
         await self.db.ensure_user(guild_id, user_id)
+        await self.db.ensure_user(guild_id, bet.creator_id)
         existing = await self.db.get_wager(bet_id, user_id)
+        wagers = await self.db.get_wagers_for_bet(bet_id)
 
-        # Refund previous wager before deducting the new amount.
+        hypothetical = _hypothetical_wagers(bet_id, wagers, user_id, pick, amount)
+        _, _, _, new_reserve = compute_bookie_reserve(
+            hypothetical, bet.yes_odds, bet.no_odds
+        )
+        new_escrow = bet.escrow_balance - (existing.amount if existing else 0) + amount
+
+        reserve_delta = new_reserve - bet.bookie_reserve
+        if reserve_delta > 0:
+            bookie_balance = await self.db.get_balance(guild_id, bet.creator_id)
+            if bookie_balance is None or bookie_balance < reserve_delta:
+                raise ValueError(
+                    "Bookie does not have enough balance to cover liability for this wager."
+                )
+
         if existing:
             await self.db.adjust_balance(guild_id, user_id, existing.amount)
 
         try:
             new_balance = await self.db.adjust_balance(guild_id, user_id, -amount)
         except ValueError:
-            # Restore previous wager if the new one cannot be funded.
             if existing:
                 await self.db.adjust_balance(guild_id, user_id, -existing.amount)
                 await self.db.upsert_wager(
@@ -192,13 +268,31 @@ class BetService:
                 )
             raise ValueError("Insufficient balance for this wager.")
 
-        wager = await self.db.upsert_wager(bet_id, user_id, pick, amount)
+        try:
+            if reserve_delta > 0:
+                await self.db.adjust_balance(
+                    guild_id, bet.creator_id, -reserve_delta
+                )
+            elif reserve_delta < 0:
+                await self.db.adjust_balance(
+                    guild_id, bet.creator_id, -reserve_delta
+                )
+            await self.db.set_bet_escrow(bet.id, new_escrow, new_reserve)
+            wager = await self.db.upsert_wager(bet_id, user_id, pick, amount)
+        except Exception:
+            await self.db.adjust_balance(guild_id, user_id, amount)
+            if existing:
+                await self.db.upsert_wager(
+                    bet_id, user_id, existing.pick, existing.amount
+                )
+            raise
+
         return wager, new_balance
 
     async def remove_wager_and_refund(
         self, guild_id: int, bet_id: int, user_id: int
     ) -> int | None:
-        """Remove a user's wager and refund their balance. Returns refund amount."""
+        """Remove a user's wager, refund bettor, and release bookie reserve."""
         bet = await self.db.get_bet(bet_id)
         if not bet or bet.status != BetStatus.OPEN:
             return None
@@ -208,6 +302,14 @@ class BetService:
             return None
 
         await self.db.adjust_balance(guild_id, user_id, wager.amount)
+        wagers = await self.db.get_wagers_for_bet(bet_id)
+        _, _, _, new_reserve = compute_bookie_reserve(
+            wagers, bet.yes_odds, bet.no_odds
+        )
+        new_escrow = bet.escrow_balance - wager.amount
+        await self._apply_reserve_change(
+            bet, new_reserve=new_reserve, new_escrow=new_escrow
+        )
         return wager.amount
 
     async def close_bet(self, bet_id: int) -> Bet | None:
@@ -217,7 +319,7 @@ class BetService:
         return await self.db.update_bet_status(bet_id, BetStatus.CLOSED)
 
     async def cancel_bet(self, bet_id: int) -> list[Wager]:
-        """Cancel an unresolved bet and refund all wagers."""
+        """Cancel an unresolved bet, refund bettors from escrow, release bookie reserve."""
         bet = await self.db.get_bet(bet_id)
         if not bet:
             raise ValueError("Bet not found.")
@@ -229,6 +331,11 @@ class BetService:
             await self.db.adjust_balance(bet.guild_id, wager.user_id, wager.amount)
             await self.db.remove_wager(bet_id, wager.user_id)
 
+        if bet.bookie_reserve > 0:
+            await self.db.adjust_balance(
+                bet.guild_id, bet.creator_id, bet.bookie_reserve
+            )
+        await self.db.set_bet_escrow(bet.id, 0, 0)
         await self.db.update_bet_status(bet_id, BetStatus.CANCELLED)
         return wagers
 
@@ -236,8 +343,8 @@ class BetService:
         self, bet_id: int, outcome: BetOutcome
     ) -> tuple[Bet, list[tuple[Wager, int]]]:
         """
-        Resolve a closed or open bet. Pays winners (or refunds everyone on REFUND).
-        Returns bet and list of (wager, payout) for winners/refunds.
+        Resolve a bet. Winners are paid from escrow; shortfall comes from the bookie
+        (balance may go negative). Surplus escrow goes to the bookie. Reserve is released.
         """
         bet = await self.db.get_bet(bet_id)
         if not bet:
@@ -249,12 +356,21 @@ class BetService:
 
         wagers = await self.db.get_wagers_for_bet(bet_id)
         payouts: list[tuple[Wager, int]] = []
+        total_payout = 0
 
         for wager in wagers:
             payout = compute_payout(wager, bet, outcome)
             if payout > 0:
                 await self.db.adjust_balance(bet.guild_id, wager.user_id, payout)
                 payouts.append((wager, payout))
+                total_payout += payout
+
+        # Escrow funds the pool; bookie nets (escrow - payouts) plus locked reserve returned.
+        bookie_settlement = bet.escrow_balance - total_payout + bet.bookie_reserve
+        await self.db.adjust_balance_allow_negative(
+            bet.guild_id, bet.creator_id, bookie_settlement
+        )
+        await self.db.set_bet_escrow(bet.id, 0, 0)
 
         await self.db.update_bet_status(bet_id, BetStatus.RESOLVED, outcome)
         updated = await self.db.get_bet(bet_id)
@@ -263,7 +379,7 @@ class BetService:
 
     async def refund_unresolved_bet(self, bet_id: int) -> tuple[Bet, int] | None:
         """
-        Refund all wagers when a closed bet was never resolved.
+        Refund all wagers from escrow when a closed bet was never resolved.
         Returns (updated_bet, refunded_wager_count) or None if not applicable.
         """
         bet = await self.db.get_bet(bet_id)
@@ -274,6 +390,12 @@ class BetService:
         for wager in wagers:
             await self.db.adjust_balance(bet.guild_id, wager.user_id, wager.amount)
             await self.db.remove_wager(bet_id, wager.user_id)
+
+        if bet.bookie_reserve > 0:
+            await self.db.adjust_balance(
+                bet.guild_id, bet.creator_id, bet.bookie_reserve
+            )
+        await self.db.set_bet_escrow(bet.id, 0, 0)
 
         updated = await self.db.update_bet_status(bet_id, BetStatus.CANCELLED)
         if not updated:
