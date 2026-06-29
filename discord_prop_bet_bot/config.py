@@ -19,6 +19,18 @@ BET_EXPIRY_CHECK_INTERVAL: int = int(os.getenv("BET_EXPIRY_CHECK_INTERVAL", "30"
 # Grace period after close_time before unresolved closed bets are auto-refunded (e.g. 24h).
 UNRESOLVED_REFUND_AFTER: str = os.getenv("UNRESOLVED_REFUND_AFTER", "24h")
 
+# Optional: restrict all bot commands and reactions to this channel ID (right-click channel → Copy Channel ID).
+_allowed_channel_raw = os.getenv("ALLOWED_CHANNEL_ID", "").strip()
+if _allowed_channel_raw:
+    try:
+        ALLOWED_CHANNEL_ID: int | None = int(_allowed_channel_raw)
+    except ValueError as exc:
+        raise SystemExit(
+            f"ALLOWED_CHANNEL_ID must be a numeric Discord channel ID, got {_allowed_channel_raw!r}"
+        ) from exc
+else:
+    ALLOWED_CHANNEL_ID = None
+
 # Emoji used for YES / NO reactions on bet messages.
 YES_EMOJI = "✅"
 NO_EMOJI = "❌"

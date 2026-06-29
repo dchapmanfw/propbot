@@ -18,6 +18,7 @@ from bets import (
     parse_duration,
     pick_from_emoji,
 )
+from channel_policy import allowed_channel_message, is_allowed_channel
 from config import NO_EMOJI, YES_EMOJI
 from database import Database
 from models import BetOutcome, BetStatus, WagerPick
@@ -134,12 +135,23 @@ class PropBetCommands(commands.Cog):
         perms = interaction.user.guild_permissions
         return bool(perms.administrator or perms.manage_guild)
 
+    async def _require_allowed_channel(self, interaction: discord.Interaction) -> bool:
+        """Reject slash commands used outside the configured betting channel."""
+        if is_allowed_channel(interaction.channel_id):
+            return True
+        await interaction.response.send_message(
+            allowed_channel_message(), ephemeral=True
+        )
+        return False
+
     @app_commands.command(name="balance", description="Show your current balance")
     async def balance(self, interaction: discord.Interaction) -> None:
         if not interaction.guild:
             await interaction.response.send_message(
                 "This command can only be used in a server.", ephemeral=True
             )
+            return
+        if not await self._require_allowed_channel(interaction):
             return
 
         user = await self.db.ensure_user(interaction.guild.id, interaction.user.id)
@@ -169,6 +181,8 @@ class PropBetCommands(commands.Cog):
             await interaction.response.send_message(
                 "This command can only be used in a server channel.", ephemeral=True
             )
+            return
+        if not await self._require_allowed_channel(interaction):
             return
 
         if yes_odds <= 0 or no_odds <= 0:
@@ -230,6 +244,8 @@ class PropBetCommands(commands.Cog):
             await interaction.response.send_message(
                 "This command can only be used in a server.", ephemeral=True
             )
+            return
+        if not await self._require_allowed_channel(interaction):
             return
 
         bet = await self.db.get_bet(bet_id)
@@ -298,6 +314,8 @@ class PropBetCommands(commands.Cog):
                 "This command can only be used in a server.", ephemeral=True
             )
             return
+        if not await self._require_allowed_channel(interaction):
+            return
 
         bet = await self.db.get_bet(bet_id)
         if not bet or bet.guild_id != interaction.guild.id:
@@ -341,6 +359,8 @@ class PropBetCommands(commands.Cog):
                 "This command can only be used in a server.", ephemeral=True
             )
             return
+        if not await self._require_allowed_channel(interaction):
+            return
 
         bet = await self.db.get_bet(bet_id)
         if not bet or bet.guild_id != interaction.guild.id:
@@ -358,6 +378,8 @@ class PropBetCommands(commands.Cog):
             await interaction.response.send_message(
                 "This command can only be used in a server.", ephemeral=True
             )
+            return
+        if not await self._require_allowed_channel(interaction):
             return
 
         bets = await self.db.get_user_bets(interaction.guild.id, interaction.user.id)
@@ -390,6 +412,8 @@ class PropBetCommands(commands.Cog):
             await interaction.response.send_message(
                 "This command can only be used in a server.", ephemeral=True
             )
+            return
+        if not await self._require_allowed_channel(interaction):
             return
 
         rows = await self.db.get_leaderboard(interaction.guild.id, limit=10)
@@ -425,6 +449,8 @@ class PropBetCommands(commands.Cog):
     @commands.Cog.listener()
     async def on_raw_reaction_add(self, payload: discord.RawReactionActionEvent) -> None:
         if payload.user_id == self.bot.user.id:
+            return
+        if not is_allowed_channel(payload.channel_id):
             return
 
         emoji = str(payload.emoji)
@@ -484,6 +510,8 @@ class PropBetCommands(commands.Cog):
         self, payload: discord.RawReactionActionEvent
     ) -> None:
         if payload.user_id == self.bot.user.id:
+            return
+        if not is_allowed_channel(payload.channel_id):
             return
 
         pick = pick_from_emoji(str(payload.emoji))
