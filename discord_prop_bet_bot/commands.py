@@ -333,9 +333,11 @@ class PropBetCommands(commands.Cog):
         if not await self._require_allowed_channel(interaction):
             return
 
+        await interaction.response.defer(ephemeral=True)
+
         user = await self.db.ensure_user(interaction.guild.id, interaction.user.id)
-        await interaction.response.send_message(
-            f"Your balance: **{user.balance}** coins.", ephemeral=True
+        await interaction.followup.send(
+            f"Your balance: **{user.balance}** coins.",
         )
 
     @app_commands.command(
@@ -451,13 +453,15 @@ class PropBetCommands(commands.Cog):
         if not await self._require_allowed_channel(interaction):
             return
 
+        await interaction.response.defer()
+
         bet = await self.db.get_bet(bet_id)
         if not bet or bet.guild_id != interaction.guild.id:
-            await interaction.response.send_message("Bet not found.", ephemeral=True)
+            await interaction.followup.send("Bet not found.", ephemeral=True)
             return
 
         if not await self._is_admin_or_creator(interaction, bet.creator_id):
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 "Only the bet creator or a server admin can resolve this bet.",
                 ephemeral=True,
             )
@@ -469,7 +473,7 @@ class PropBetCommands(commands.Cog):
                 bet = await self.db.get_bet(bet_id)
                 assert bet is not None
             else:
-                await interaction.response.send_message(
+                await interaction.followup.send(
                     "This bet is still open. Wait until betting closes, then resolve.",
                     ephemeral=True,
                 )
@@ -481,7 +485,7 @@ class PropBetCommands(commands.Cog):
                 bet_id, BetOutcome(outcome.value)
             )
         except ValueError as exc:
-            await interaction.response.send_message(str(exc), ephemeral=True)
+            await interaction.followup.send(str(exc), ephemeral=True)
             return
 
         wagers = await self.db.get_wagers_for_bet(bet_id)
@@ -505,7 +509,7 @@ class PropBetCommands(commands.Cog):
                 )
 
         result_text = "\n".join(lines) if lines else "_No winning wagers._"
-        await interaction.response.send_message(
+        await interaction.followup.send(
             content=f"Bet #{bet_id} resolved.\n{result_text}",
             embed=embed,
         )
@@ -526,13 +530,15 @@ class PropBetCommands(commands.Cog):
         if not await self._require_allowed_channel(interaction):
             return
 
+        await interaction.response.defer()
+
         bet = await self.db.get_bet(bet_id)
         if not bet or bet.guild_id != interaction.guild.id:
-            await interaction.response.send_message("Bet not found.", ephemeral=True)
+            await interaction.followup.send("Bet not found.", ephemeral=True)
             return
 
         if not await self._is_admin_or_creator(interaction, bet.creator_id):
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 "Only the bet creator or a server admin can cancel this bet.",
                 ephemeral=True,
             )
@@ -542,7 +548,7 @@ class PropBetCommands(commands.Cog):
         try:
             wagers = await service.cancel_bet(bet_id)
         except ValueError as exc:
-            await interaction.response.send_message(str(exc), ephemeral=True)
+            await interaction.followup.send(str(exc), ephemeral=True)
             return
 
         bet = await self.db.get_bet(bet_id)
@@ -550,7 +556,7 @@ class PropBetCommands(commands.Cog):
         creator = interaction.guild.get_member(bet.creator_id)
         embed = build_bet_embed(bet, creator=creator, footer_extra="Cancelled — all wagers refunded")
 
-        await interaction.response.send_message(
+        await interaction.followup.send(
             f"Bet #{bet_id} cancelled. Refunded **{len(wagers)}** wager(s).",
             embed=embed,
         )
@@ -571,15 +577,17 @@ class PropBetCommands(commands.Cog):
         if not await self._require_allowed_channel(interaction):
             return
 
+        await interaction.response.defer(ephemeral=True)
+
         bet = await self.db.get_bet(bet_id)
         if not bet or bet.guild_id != interaction.guild.id:
-            await interaction.response.send_message("Bet not found.", ephemeral=True)
+            await interaction.followup.send("Bet not found.")
             return
 
         wagers = await self.db.get_wagers_for_bet(bet_id)
         creator = interaction.guild.get_member(bet.creator_id)
         embed = build_bet_embed(bet, creator=creator, wagers=wagers)
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+        await interaction.followup.send(embed=embed)
 
     @app_commands.command(name="my_bets", description="Show your active and recent bets")
     async def my_bets(self, interaction: discord.Interaction) -> None:
@@ -591,10 +599,12 @@ class PropBetCommands(commands.Cog):
         if not await self._require_allowed_channel(interaction):
             return
 
+        await interaction.response.defer(ephemeral=True)
+
         bets = await self.db.get_user_bets(interaction.guild.id, interaction.user.id)
         if not bets:
-            await interaction.response.send_message(
-                "You have no bets in this server yet.", ephemeral=True
+            await interaction.followup.send(
+                "You have no bets in this server yet.",
             )
             return
 
@@ -613,7 +623,7 @@ class PropBetCommands(commands.Cog):
             description="\n".join(lines[:10]),
             color=discord.Color.blurple(),
         )
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+        await interaction.followup.send(embed=embed)
 
     @app_commands.command(name="leaderboard", description="Top balances in this server")
     async def leaderboard(self, interaction: discord.Interaction) -> None:

@@ -161,7 +161,8 @@ async def test_help_command_wrong_channel_hint(cog, monkeypatch):
 async def test_balance_command(cog, db):
     interaction = make_interaction(user_id=BETTOR_ID)
     await call_slash(cog, cog.balance, interaction)
-    interaction.response.send_message.assert_awaited_once()
+    interaction.response.defer.assert_awaited_once_with(ephemeral=True)
+    interaction.followup.send.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -227,17 +228,23 @@ async def test_bet_resolve_paths(cog, db, bot_mock):
     await call_slash(
         cog, cog.bet_resolve, interaction, 9999, app_commands.Choice(name="YES", value="yes")
     )
+    interaction.response.defer.assert_awaited_once()
+    interaction.followup.send.assert_awaited_once()
 
     bet_id = await _open_bet(db)
     interaction = make_interaction(user_id=BETTOR_ID)
     await call_slash(
         cog, cog.bet_resolve, interaction, bet_id, app_commands.Choice(name="YES", value="yes")
     )
+    interaction.response.defer.assert_awaited_once()
+    interaction.followup.send.assert_awaited_once()
 
     interaction = make_interaction(user_id=BOOKIE_ID)
     await call_slash(
         cog, cog.bet_resolve, interaction, bet_id, app_commands.Choice(name="YES", value="yes")
     )
+    interaction.response.defer.assert_awaited_once()
+    interaction.followup.send.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -260,7 +267,8 @@ async def test_bet_resolve_success_with_refund(cog, db, bot_mock):
         bet_id,
         app_commands.Choice(name="Refund", value="refund"),
     )
-    interaction.response.send_message.assert_awaited_once()
+    interaction.response.defer.assert_awaited_once()
+    interaction.followup.send.assert_awaited_once()
     bot_mock.untrack_bet.assert_called_once_with(bet_id)
 
 
@@ -282,7 +290,8 @@ async def test_bet_resolve_winner_message(cog, db, bot_mock):
         bet_id,
         app_commands.Choice(name="YES", value="yes"),
     )
-    interaction.response.send_message.assert_awaited_once()
+    interaction.response.defer.assert_awaited_once()
+    interaction.followup.send.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -292,7 +301,8 @@ async def test_bet_resolve_auto_closes_expired_open_bet(cog, db):
     await call_slash(
         cog, cog.bet_resolve, interaction, bet_id, app_commands.Choice(name="YES", value="yes")
     )
-    interaction.response.send_message.assert_awaited_once()
+    interaction.response.defer.assert_awaited_once()
+    interaction.followup.send.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -303,10 +313,14 @@ async def test_bet_cancel_paths(cog, db, bot_mock):
 
     interaction = make_interaction()
     await call_slash(cog, cog.bet_cancel, interaction, 9999)
+    interaction.response.defer.assert_awaited_once()
+    interaction.followup.send.assert_awaited_once()
 
     bet_id = await _open_bet(db)
     interaction = make_interaction(user_id=BETTOR_ID)
     await call_slash(cog, cog.bet_cancel, interaction, bet_id)
+    interaction.response.defer.assert_awaited_once()
+    interaction.followup.send.assert_awaited_once()
 
     interaction = make_interaction(user_id=BOOKIE_ID)
     channel = MagicMock()
@@ -322,7 +336,8 @@ async def test_bet_cancel_already_resolved(cog, db):
     await db.update_bet_status(bet_id, BetStatus.RESOLVED, BetOutcome.YES)
     interaction = make_interaction(user_id=BOOKIE_ID)
     await call_slash(cog, cog.bet_cancel, interaction, bet_id)
-    interaction.response.send_message.assert_awaited_once()
+    interaction.response.defer.assert_awaited_once()
+    interaction.followup.send.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -332,11 +347,14 @@ async def test_bet_status_paths(cog, db):
 
     interaction = make_interaction()
     await call_slash(cog, cog.bet_status, interaction, 9999)
+    interaction.response.defer.assert_awaited_once_with(ephemeral=True)
+    interaction.followup.send.assert_awaited_once()
 
     bet_id = await _open_bet(db)
     interaction = make_interaction()
     await call_slash(cog, cog.bet_status, interaction, bet_id)
-    interaction.response.send_message.assert_awaited_once()
+    interaction.response.defer.assert_awaited_once_with(ephemeral=True)
+    interaction.followup.send.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -346,13 +364,16 @@ async def test_my_bets_paths(cog, db):
 
     interaction = make_interaction(user_id=777)
     await call_slash(cog, cog.my_bets, interaction)
+    interaction.response.defer.assert_awaited_once_with(ephemeral=True)
+    interaction.followup.send.assert_awaited_once()
 
     bet_id = await _open_bet(db)
     await db.ensure_user(1, BETTOR_ID)
     await db.upsert_wager(bet_id, BETTOR_ID, WagerPick.YES, 10)
     interaction = make_interaction(user_id=BETTOR_ID)
     await call_slash(cog, cog.my_bets, interaction)
-    interaction.response.send_message.assert_awaited_once()
+    interaction.response.defer.assert_awaited_once_with(ephemeral=True)
+    interaction.followup.send.assert_awaited_once()
 
 
 @pytest.mark.asyncio
