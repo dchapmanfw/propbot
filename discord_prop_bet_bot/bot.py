@@ -24,7 +24,6 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 INTENTS = discord.Intents.default()
-INTENTS.message_content = True
 INTENTS.guilds = True
 INTENTS.members = True
 INTENTS.reactions = True
@@ -37,6 +36,7 @@ class PropBetBot(commands.Bot):
         super().__init__(command_prefix="!", intents=INTENTS)
         self.db = Database()
         self._open_bet_ids: set[int] = set()
+        self._wager_prompt_at: dict[tuple[int, int], float] = {}
         try:
             self._unresolved_refund_after = parse_duration(UNRESOLVED_REFUND_AFTER)
         except DurationParseError as exc:

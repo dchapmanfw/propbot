@@ -116,6 +116,7 @@ async def test_resolve_pays_winners(service):
 
     await svc.place_or_update_wager(1, bet_id, 50, WagerPick.YES, 100)
     await svc.place_or_update_wager(1, bet_id, 51, WagerPick.NO, 100)
+    await svc.close_bet(bet_id)
 
     bet, payouts = await svc.resolve_bet(bet_id, BetOutcome.YES)
     assert bet.status == BetStatus.RESOLVED
@@ -133,6 +134,7 @@ async def test_resolve_refund_returns_all_wagers(service):
     await db.ensure_user(1, 50)
 
     await svc.place_or_update_wager(1, bet_id, 50, WagerPick.YES, 250)
+    await svc.close_bet(bet_id)
     await svc.resolve_bet(bet_id, BetOutcome.REFUND)
 
     assert await db.get_balance(1, 50) == STARTING_BALANCE

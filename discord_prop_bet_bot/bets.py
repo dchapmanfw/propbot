@@ -7,7 +7,7 @@ from datetime import datetime, timedelta, timezone
 
 import discord
 
-from config import NO_EMOJI, YES_EMOJI
+from config import ALLOWED_CHANNEL_ID, NO_EMOJI, STARTING_BALANCE, YES_EMOJI
 from database import Database
 from models import Bet, BetOutcome, BetStatus, Wager, WagerPick
 
@@ -188,6 +188,99 @@ def build_bet_embed(
     return embed
 
 
+def build_help_embed() -> discord.Embed:
+    """Build the /help guide embed."""
+    channel_note = (
+        f"Use <#{ALLOWED_CHANNEL_ID}> for all bot commands and bets."
+        if ALLOWED_CHANNEL_ID is not None
+        else "Commands work in any channel unless your server configures a dedicated betting channel."
+    )
+
+    embed = discord.Embed(
+        title="Prop Bet Bot — How to Play",
+        description=(
+            f"Wager fictional coins on yes/no predictions — **for fun only**. "
+            f"Everyone starts with **{STARTING_BALANCE}** coins per server.\n\n"
+            f"{channel_note}"
+        ),
+        color=discord.Color.blurple(),
+    )
+
+    embed.add_field(
+        name="For fun only — fictional currency",
+        value=(
+            "Coins in this bot are **play money** with **no real-world value**. "
+            "They cannot be bought, sold, traded, or cashed out.\n"
+            "This bot is meant for **entertainment in your server**, not real wagers. "
+            "Do not use it for real-money betting, gambling, or anything illegal."
+        ),
+        inline=False,
+    )
+
+    embed.add_field(
+        name="1. Create a bet (bookie)",
+        value=(
+            "`/bet_create question:\"Will X happen?\" duration:2h yes_odds:1.5 no_odds:2.0`\n"
+            "You are the **bookie** — wagers go into escrow and you cover payouts from your balance. "
+            "You **cannot** wager on your own bet.\n"
+            "Duration examples: `30m`, `2h`, `1d`"
+        ),
+        inline=False,
+    )
+
+    embed.add_field(
+        name="2. Join a bet",
+        value=(
+            f"React {YES_EMOJI} for **YES** or {NO_EMOJI} for **NO** on the bet message, "
+            "then click **Enter wager** and submit your amount.\n"
+            "• Change your mind before close — react again and enter a new amount\n"
+            "• Remove your reaction to cancel and refund your wager"
+        ),
+        inline=False,
+    )
+
+    embed.add_field(
+        name="3. After betting closes",
+        value=(
+            "The bet creator (or a server admin) runs `/bet_resolve` with **YES**, **NO**, "
+            "or **Refund** (tie / N/A).\n"
+            "Winners receive `wager × odds`. Unresolved closed bets are auto-refunded after a grace period."
+        ),
+        inline=False,
+    )
+
+    embed.add_field(
+        name="Commands",
+        value=(
+            "`/balance` — your coin balance\n"
+            "`/bet_create` — open a new bet (you are the bookie)\n"
+            "`/bet_status bet_id` — bet details and participants\n"
+            "`/bet_resolve bet_id outcome` — settle a bet (creator or admin)\n"
+            "`/bet_cancel bet_id` — cancel and refund all wagers (creator or admin)\n"
+            "`/my_bets` — your recent and active bets\n"
+            "`/leaderboard` — top balances in this server\n"
+            "`/help` — show this guide"
+        ),
+        inline=False,
+    )
+
+    embed.add_field(
+        name="Bookie tips",
+        value=(
+            "• Set **yes_odds** and **no_odds** separately to shape action on each side\n"
+            "• Your balance must cover **reserve** (worst-case payout) as wagers come in\n"
+            "• If payouts exceed the pool, the shortfall comes from your balance (can go negative)"
+        ),
+        inline=False,
+    )
+
+    embed.set_footer(
+        text="Play-money only — not for real wagers. "
+        "Need DMs enabled for wager prompts, or use the in-channel button fallback."
+    )
+    return embed
+
+
 class BetService:
     """Coordinates bet lifecycle with bookie escrow and liability reserves."""
 
@@ -268,22 +361,31 @@ class BetService:
                 )
             raise ValueError("Insufficient balance for this wager.")
 
+        bookie_adjusted = False
+        escrow_updated = False
         try:
-            if reserve_delta > 0:
+            if reserve_delta != 0:
                 await self.db.adjust_balance(
                     guild_id, bet.creator_id, -reserve_delta
                 )
-            elif reserve_delta < 0:
-                await self.db.adjust_balance(
-                    guild_id, bet.creator_id, -reserve_delta
-                )
+                bookie_adjusted = True
             await self.db.set_bet_escrow(bet.id, new_escrow, new_reserve)
+            escrow_updated = True
             wager = await self.db.upsert_wager(bet_id, user_id, pick, amount)
         except Exception:
             await self.db.adjust_balance(guild_id, user_id, amount)
             if existing:
+                await self.db.adjust_balance(guild_id, user_id, -existing.amount)
                 await self.db.upsert_wager(
                     bet_id, user_id, existing.pick, existing.amount
+                )
+            if bookie_adjusted:
+                await self.db.adjust_balance(
+                    guild_id, bet.creator_id, reserve_delta
+                )
+            if escrow_updated:
+                await self.db.set_bet_escrow(
+                    bet.id, bet.escrow_balance, bet.bookie_reserve
                 )
             raise
 
@@ -353,8 +455,17 @@ class BetService:
             raise ValueError("Bet is already resolved.")
         if bet.status == BetStatus.CANCELLED:
             raise ValueError("Bet was cancelled.")
+        if bet.status != BetStatus.CLOSED:
+            raise ValueError("Bet must be closed before it can be resolved.")
 
         wagers = await self.db.get_wagers_for_bet(bet_id)
+        escrow_balance = bet.escrow_balance
+        bookie_reserve = bet.bookie_reserve
+
+        claimed = await self.db.claim_bet_for_resolution(bet_id, outcome)
+        if not claimed:
+            raise ValueError("Bet is already resolved.")
+
         payouts: list[tuple[Wager, int]] = []
         total_payout = 0
 
@@ -366,16 +477,13 @@ class BetService:
                 total_payout += payout
 
         # Escrow funds the pool; bookie nets (escrow - payouts) plus locked reserve returned.
-        bookie_settlement = bet.escrow_balance - total_payout + bet.bookie_reserve
+        bookie_settlement = escrow_balance - total_payout + bookie_reserve
         await self.db.adjust_balance_allow_negative(
             bet.guild_id, bet.creator_id, bookie_settlement
         )
         await self.db.set_bet_escrow(bet.id, 0, 0)
 
-        await self.db.update_bet_status(bet_id, BetStatus.RESOLVED, outcome)
-        updated = await self.db.get_bet(bet_id)
-        assert updated is not None
-        return updated, payouts
+        return claimed, payouts
 
     async def refund_unresolved_bet(self, bet_id: int) -> tuple[Bet, int] | None:
         """

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
@@ -14,12 +15,13 @@ from bets import (
     BetService,
     DurationParseError,
     build_bet_embed,
+    build_help_embed,
     emoji_from_pick,
     parse_duration,
     pick_from_emoji,
 )
 from channel_policy import allowed_channel_message, is_allowed_channel
-from config import NO_EMOJI, YES_EMOJI
+from config import ALLOWED_CHANNEL_ID, NO_EMOJI, YES_EMOJI
 from database import Database
 from models import BetOutcome, BetStatus, WagerPick
 
@@ -27,6 +29,9 @@ if TYPE_CHECKING:
     from bot import PropBetBot
 
 logger = logging.getLogger(__name__)
+
+# Seconds before re-prompting the same user on the same bet after a reaction.
+WAGER_PROMPT_COOLDOWN = 120
 
 
 class WagerModal(discord.ui.Modal, title="Enter your wager"):
@@ -81,6 +86,7 @@ class WagerModal(discord.ui.Modal, title="Enter your wager"):
         )
 
         await self.bot.refresh_bet_message(self.bet_id)
+        self.bot._wager_prompt_at.pop((interaction.user.id, self.bet_id), None)
 
 
 class WagerButtonView(discord.ui.View):
@@ -125,6 +131,43 @@ class PropBetCommands(commands.Cog):
         self.bot = bot
         self.db: Database = bot.db
 
+    async def _notify_user(
+        self,
+        user: discord.User | discord.Member,
+        channel_id: int,
+        content: str,
+        *,
+        view: discord.ui.View | None = None,
+        delete_after: float | None = None,
+        prefer_channel: bool = False,
+    ) -> None:
+        """Deliver a message via DM, falling back to the bet channel on failure."""
+        channel = self.bot.get_channel(channel_id)
+        channel_content = f"{user.mention} {content}"
+
+        if prefer_channel and channel is not None:
+            await channel.send(channel_content, view=view, delete_after=delete_after)
+            return
+
+        try:
+            await user.send(content, view=view)
+        except (discord.Forbidden, discord.HTTPException) as exc:
+            logger.debug("DM to %s failed (%s), using channel fallback", user.id, exc)
+            if channel is not None:
+                await channel.send(
+                    channel_content,
+                    view=view,
+                    delete_after=delete_after or 120,
+                )
+
+    def _should_prompt_wager(self, user_id: int, bet_id: int) -> bool:
+        key = (user_id, bet_id)
+        last = self.bot._wager_prompt_at.get(key)
+        if last is not None and time.monotonic() - last < WAGER_PROMPT_COOLDOWN:
+            return False
+        self.bot._wager_prompt_at[key] = time.monotonic()
+        return True
+
     async def _is_admin_or_creator(
         self, interaction: discord.Interaction, bet_creator_id: int
     ) -> bool:
@@ -143,6 +186,27 @@ class PropBetCommands(commands.Cog):
             allowed_channel_message(), ephemeral=True
         )
         return False
+
+    @app_commands.command(name="help", description="How to use the prop bet bot")
+    async def help_command(self, interaction: discord.Interaction) -> None:
+        if not interaction.guild:
+            await interaction.response.send_message(
+                "This command can only be used in a server.", ephemeral=True
+            )
+            return
+
+        embed = build_help_embed()
+        if (
+            ALLOWED_CHANNEL_ID is not None
+            and interaction.channel_id != ALLOWED_CHANNEL_ID
+        ):
+            embed.add_field(
+                name="Wrong channel?",
+                value=allowed_channel_message(),
+                inline=False,
+            )
+
+        await interaction.response.send_message(embed=embed, ephemeral=True)
 
     @app_commands.command(name="balance", description="Show your current balance")
     async def balance(self, interaction: discord.Interaction) -> None:
@@ -215,8 +279,30 @@ class PropBetCommands(commands.Cog):
         message = await interaction.original_response()
 
         await self.db.set_bet_message_id(bet.id, message.id)
-        await message.add_reaction(YES_EMOJI)
-        await message.add_reaction(NO_EMOJI)
+        try:
+            await message.add_reaction(YES_EMOJI)
+            await message.add_reaction(NO_EMOJI)
+        except discord.Forbidden:
+            logger.warning(
+                "Missing channel access to add reactions in channel %s",
+                interaction.channel.id,
+            )
+            try:
+                await BetService(self.db).cancel_bet(bet.id)
+            except ValueError:
+                pass
+            try:
+                await message.delete()
+            except discord.Forbidden:
+                pass
+            await interaction.followup.send(
+                "I posted the bet but **could not add reactions** in this channel "
+                f"({interaction.channel.mention}).\n\n"
+                "Give my role **View Channel**, **Send Messages**, **Add Reactions**, "
+                "and **Read Message History** in this channel, then run `/bet_create` again.",
+                ephemeral=True,
+            )
+            return
 
         bet = await self.db.get_bet(bet.id)
         assert bet is not None
@@ -260,11 +346,17 @@ class PropBetCommands(commands.Cog):
             )
             return
 
-        # Auto-close if still open but past close time or manually resolving early.
         if bet.status == BetStatus.OPEN:
-            await BetService(self.db).close_bet(bet_id)
-            bet = await self.db.get_bet(bet_id)
-            assert bet is not None
+            if datetime.now(timezone.utc) >= bet.close_time:
+                await BetService(self.db).close_bet(bet_id)
+                bet = await self.db.get_bet(bet_id)
+                assert bet is not None
+            else:
+                await interaction.response.send_message(
+                    "This bet is still open. Wait until betting closes, then resolve.",
+                    ephemeral=True,
+                )
+                return
 
         service = BetService(self.db)
         try:
@@ -471,15 +563,20 @@ class PropBetCommands(commands.Cog):
             user = self.bot.get_user(payload.user_id) or await self.bot.fetch_user(
                 payload.user_id
             )
-            try:
-                await user.send("You cannot wager on a bet you created.")
-            except discord.Forbidden:
-                channel = self.bot.get_channel(payload.channel_id)
-                if channel:
-                    await channel.send(
-                        f"{user.mention} You cannot wager on a bet you created.",
-                        delete_after=15,
-                    )
+            await self._notify_user(
+                user,
+                payload.channel_id,
+                "You cannot wager on a bet you created.",
+                delete_after=15,
+                prefer_channel=True,
+            )
+            return
+
+        existing = await self.db.get_wager(bet.id, payload.user_id)
+        if existing and existing.pick == pick:
+            return
+
+        if not self._should_prompt_wager(payload.user_id, bet.id):
             return
 
         user = self.bot.get_user(payload.user_id) or await self.bot.fetch_user(
@@ -494,16 +591,13 @@ class PropBetCommands(commands.Cog):
             f"Click **Enter wager** to set your amount."
         )
 
-        try:
-            await user.send(prompt, view=view)
-        except discord.Forbidden:
-            channel = self.bot.get_channel(payload.channel_id)
-            if channel:
-                await channel.send(
-                    f"{user.mention} I couldn't DM you. Click below to enter your wager:",
-                    view=view,
-                    delete_after=120,
-                )
+        await self._notify_user(
+            user,
+            payload.channel_id,
+            prompt,
+            view=view,
+            delete_after=120,
+        )
 
     @commands.Cog.listener()
     async def on_raw_reaction_remove(
@@ -522,19 +616,25 @@ class PropBetCommands(commands.Cog):
         if not bet or bet.status != BetStatus.OPEN:
             return
 
+        existing = await self.db.get_wager(bet.id, payload.user_id)
+        if not existing or existing.pick != pick:
+            return
+
         service = BetService(self.db)
         refunded = await service.remove_wager_and_refund(
             bet.guild_id, bet.id, payload.user_id
         )
         if refunded:
             await self.bot.refresh_bet_message(bet.id)
+            self.bot._wager_prompt_at.pop((payload.user_id, bet.id), None)
             user = self.bot.get_user(payload.user_id) or await self.bot.fetch_user(
                 payload.user_id
             )
-            try:
-                await user.send(
-                    f"Your wager of **{refunded}** on bet #{bet.id} was removed and refunded."
-                )
-            except discord.Forbidden:
-                pass
+            await self._notify_user(
+                user,
+                payload.channel_id,
+                f"Your wager of **{refunded}** on bet #{bet.id} was removed and refunded.",
+                delete_after=30,
+                prefer_channel=True,
+            )
 

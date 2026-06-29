@@ -266,6 +266,28 @@ class Database:
         await self.conn.commit()
         return await self.get_bet(bet_id)
 
+    async def claim_bet_for_resolution(
+        self, bet_id: int, outcome: BetOutcome
+    ) -> Bet | None:
+        """Atomically mark a closed bet resolved; returns None if not claimable."""
+        cursor = await self.conn.execute(
+            """
+            UPDATE bets
+            SET status = ?, outcome = ?
+            WHERE id = ? AND status = ?
+            """,
+            (
+                BetStatus.RESOLVED.value,
+                outcome.value,
+                bet_id,
+                BetStatus.CLOSED.value,
+            ),
+        )
+        await self.conn.commit()
+        if cursor.rowcount == 0:
+            return None
+        return await self.get_bet(bet_id)
+
     async def get_open_bets(self) -> list[Bet]:
         cursor = await self.conn.execute(
             "SELECT * FROM bets WHERE status = ? ORDER BY close_time ASC",
