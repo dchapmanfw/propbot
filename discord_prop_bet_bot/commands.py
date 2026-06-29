@@ -625,11 +625,12 @@ class PropBetCommands(commands.Cog):
         if not await self._require_allowed_channel(interaction):
             return
 
+        await interaction.response.defer()
+
         rows = await self.db.get_leaderboard(interaction.guild.id, limit=10)
         if not rows:
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 "No balances recorded yet. Place a bet to get started!",
-                ephemeral=True,
             )
             return
 
@@ -644,7 +645,7 @@ class PropBetCommands(commands.Cog):
             description="\n".join(lines),
             color=discord.Color.gold(),
         )
-        await interaction.response.send_message(embed=embed)
+        await interaction.followup.send(embed=embed)
 
     async def _get_bet_message(self, bet) -> discord.Message | None:
         channel = self.bot.get_channel(bet.channel_id)

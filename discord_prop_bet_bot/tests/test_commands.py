@@ -362,11 +362,14 @@ async def test_leaderboard_paths(cog, db):
 
     interaction = make_interaction()
     await call_slash(cog, cog.leaderboard, interaction)
+    interaction.response.defer.assert_awaited_once()
+    interaction.followup.send.assert_awaited_once()
 
     await db.ensure_user(1, BETTOR_ID)
     interaction = make_interaction()
     await call_slash(cog, cog.leaderboard, interaction)
-    interaction.response.send_message.assert_awaited_once()
+    interaction.response.defer.assert_awaited_once()
+    interaction.followup.send.assert_awaited_once()
 
 
 @pytest.mark.asyncio
