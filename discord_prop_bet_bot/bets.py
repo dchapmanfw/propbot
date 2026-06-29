@@ -288,19 +288,39 @@ class BetService:
         self.db = db
 
     async def _apply_reserve_change(
-        self, bet: Bet, new_reserve: int, new_escrow: int
+        self,
+        bet: Bet,
+        new_reserve: int,
+        new_escrow: int,
+        *,
+        commit: bool = True,
     ) -> None:
         """Lock or release bookie funds when reserve changes."""
         reserve_delta = new_reserve - bet.bookie_reserve
-        if reserve_delta > 0:
+        if reserve_delta != 0:
             await self.db.adjust_balance(
-                bet.guild_id, bet.creator_id, -reserve_delta
+                bet.guild_id, bet.creator_id, -reserve_delta, commit=commit
             )
-        elif reserve_delta < 0:
+        await self.db.set_bet_escrow(
+            bet.id, new_escrow, new_reserve, commit=commit
+        )
+
+    async def _refund_wagers_and_release_reserve(
+        self,
+        bet: Bet,
+        wagers: list[Wager],
+    ) -> None:
+        """Refund all wagers, clear escrow, and release bookie reserve."""
+        for wager in wagers:
             await self.db.adjust_balance(
-                bet.guild_id, bet.creator_id, -reserve_delta
+                bet.guild_id, wager.user_id, wager.amount, commit=False
             )
-        await self.db.set_bet_escrow(bet.id, new_escrow, new_reserve)
+        await self.db.remove_all_wagers_for_bet(bet.id, commit=False)
+        if bet.bookie_reserve > 0:
+            await self.db.adjust_balance(
+                bet.guild_id, bet.creator_id, bet.bookie_reserve, commit=False
+            )
+        await self.db.set_bet_escrow(bet.id, 0, 0, commit=False)
 
     async def place_or_update_wager(
         self,
@@ -317,77 +337,63 @@ class BetService:
         if amount <= 0:
             raise ValueError("Wager must be a positive integer.")
 
-        bet = await self.db.get_bet(bet_id)
-        if not bet:
-            raise ValueError("Bet not found.")
-        if bet.guild_id != guild_id:
-            raise ValueError("Bet does not belong to this server.")
-        if bet.status != BetStatus.OPEN:
-            raise ValueError("This bet is no longer open.")
-        if datetime.now(timezone.utc) >= bet.close_time:
-            raise ValueError("This bet has already closed.")
-        if user_id == bet.creator_id:
-            raise ValueError("You cannot wager on a bet you created.")
+        async with self.db.transaction():
+            bet = await self.db.get_bet(bet_id)
+            if not bet:
+                raise ValueError("Bet not found.")
+            if bet.guild_id != guild_id:
+                raise ValueError("Bet does not belong to this server.")
+            if bet.status != BetStatus.OPEN:
+                raise ValueError("This bet is no longer open.")
+            if datetime.now(timezone.utc) >= bet.close_time:
+                raise ValueError("This bet has already closed.")
+            if user_id == bet.creator_id:
+                raise ValueError("You cannot wager on a bet you created.")
 
-        await self.db.ensure_user(guild_id, user_id)
-        await self.db.ensure_user(guild_id, bet.creator_id)
-        existing = await self.db.get_wager(bet_id, user_id)
-        wagers = await self.db.get_wagers_for_bet(bet_id)
+            await self.db.ensure_users(
+                guild_id, [user_id, bet.creator_id], commit=False
+            )
+            existing = await self.db.get_wager(bet_id, user_id)
+            wagers = await self.db.get_wagers_for_bet(bet_id)
 
-        hypothetical = _hypothetical_wagers(bet_id, wagers, user_id, pick, amount)
-        _, _, _, new_reserve = compute_bookie_reserve(
-            hypothetical, bet.yes_odds, bet.no_odds
-        )
-        new_escrow = bet.escrow_balance - (existing.amount if existing else 0) + amount
+            hypothetical = _hypothetical_wagers(bet_id, wagers, user_id, pick, amount)
+            _, _, _, new_reserve = compute_bookie_reserve(
+                hypothetical, bet.yes_odds, bet.no_odds
+            )
+            new_escrow = (
+                bet.escrow_balance - (existing.amount if existing else 0) + amount
+            )
 
-        reserve_delta = new_reserve - bet.bookie_reserve
-        if reserve_delta > 0:
-            bookie_balance = await self.db.get_balance(guild_id, bet.creator_id)
-            if bookie_balance is None or bookie_balance < reserve_delta:
-                raise ValueError(
-                    "Bookie does not have enough balance to cover liability for this wager."
-                )
+            reserve_delta = new_reserve - bet.bookie_reserve
+            if reserve_delta > 0:
+                bookie_balance = await self.db.get_balance(guild_id, bet.creator_id)
+                if bookie_balance is None or bookie_balance < reserve_delta:
+                    raise ValueError(
+                        "Bookie does not have enough balance to cover liability for this wager."
+                    )
 
-        if existing:
-            await self.db.adjust_balance(guild_id, user_id, existing.amount)
-
-        try:
-            new_balance = await self.db.adjust_balance(guild_id, user_id, -amount)
-        except ValueError:
             if existing:
-                await self.db.adjust_balance(guild_id, user_id, -existing.amount)
-                await self.db.upsert_wager(
-                    bet_id, user_id, existing.pick, existing.amount
+                await self.db.adjust_balance(
+                    guild_id, user_id, existing.amount, commit=False
                 )
-            raise ValueError("Insufficient balance for this wager.")
 
-        bookie_adjusted = False
-        escrow_updated = False
-        try:
+            try:
+                new_balance = await self.db.adjust_balance(
+                    guild_id, user_id, -amount, commit=False
+                )
+            except ValueError:
+                raise ValueError("Insufficient balance for this wager.") from None
+
             if reserve_delta != 0:
                 await self.db.adjust_balance(
-                    guild_id, bet.creator_id, -reserve_delta
+                    guild_id, bet.creator_id, -reserve_delta, commit=False
                 )
-                bookie_adjusted = True
-            await self.db.set_bet_escrow(bet.id, new_escrow, new_reserve)
-            escrow_updated = True
-            wager = await self.db.upsert_wager(bet_id, user_id, pick, amount)
-        except Exception:
-            await self.db.adjust_balance(guild_id, user_id, amount)
-            if existing:
-                await self.db.adjust_balance(guild_id, user_id, -existing.amount)
-                await self.db.upsert_wager(
-                    bet_id, user_id, existing.pick, existing.amount
-                )
-            if bookie_adjusted:
-                await self.db.adjust_balance(
-                    guild_id, bet.creator_id, reserve_delta
-                )
-            if escrow_updated:
-                await self.db.set_bet_escrow(
-                    bet.id, bet.escrow_balance, bet.bookie_reserve
-                )
-            raise
+            await self.db.set_bet_escrow(
+                bet.id, new_escrow, new_reserve, commit=False
+            )
+            wager = await self.db.upsert_wager(
+                bet_id, user_id, pick, amount, commit=False
+            )
 
         return wager, new_balance
 
@@ -395,23 +401,32 @@ class BetService:
         self, guild_id: int, bet_id: int, user_id: int
     ) -> int | None:
         """Remove a user's wager, refund bettor, and release bookie reserve."""
-        bet = await self.db.get_bet(bet_id)
-        if not bet or bet.status != BetStatus.OPEN:
-            return None
+        async with self.db.transaction():
+            bet = await self.db.get_bet(bet_id)
+            if not bet or bet.status != BetStatus.OPEN:
+                return None
 
-        wager = await self.db.remove_wager(bet_id, user_id)
-        if not wager:
-            return None
+            wager = await self.db.get_wager(bet_id, user_id)
+            if not wager:
+                return None
 
-        await self.db.adjust_balance(guild_id, user_id, wager.amount)
-        wagers = await self.db.get_wagers_for_bet(bet_id)
-        _, _, _, new_reserve = compute_bookie_reserve(
-            wagers, bet.yes_odds, bet.no_odds
-        )
-        new_escrow = bet.escrow_balance - wager.amount
-        await self._apply_reserve_change(
-            bet, new_reserve=new_reserve, new_escrow=new_escrow
-        )
+            await self.db.adjust_balance(
+                guild_id, user_id, wager.amount, commit=False
+            )
+            await self.db.remove_wager(bet_id, user_id, commit=False)
+
+            wagers = await self.db.get_wagers_for_bet(bet_id)
+            _, _, _, new_reserve = compute_bookie_reserve(
+                wagers, bet.yes_odds, bet.no_odds
+            )
+            new_escrow = bet.escrow_balance - wager.amount
+            await self._apply_reserve_change(
+                bet,
+                new_reserve=new_reserve,
+                new_escrow=new_escrow,
+                commit=False,
+            )
+
         return wager.amount
 
     async def close_bet(self, bet_id: int) -> Bet | None:
@@ -429,16 +444,19 @@ class BetService:
             raise ValueError("Bet cannot be cancelled.")
 
         wagers = await self.db.get_wagers_for_bet(bet_id)
-        for wager in wagers:
-            await self.db.adjust_balance(bet.guild_id, wager.user_id, wager.amount)
-            await self.db.remove_wager(bet_id, wager.user_id)
+        bet_snapshot = bet
 
-        if bet.bookie_reserve > 0:
-            await self.db.adjust_balance(
-                bet.guild_id, bet.creator_id, bet.bookie_reserve
+        async with self.db.transaction():
+            claimed = await self.db.claim_bet_for_cancellation(
+                bet_id,
+                from_statuses=(BetStatus.OPEN, BetStatus.CLOSED),
+                commit=False,
             )
-        await self.db.set_bet_escrow(bet.id, 0, 0)
-        await self.db.update_bet_status(bet_id, BetStatus.CANCELLED)
+            if not claimed:
+                raise ValueError("Bet cannot be cancelled.")
+
+            await self._refund_wagers_and_release_reserve(bet_snapshot, wagers)
+
         return wagers
 
     async def resolve_bet(
@@ -462,26 +480,30 @@ class BetService:
         escrow_balance = bet.escrow_balance
         bookie_reserve = bet.bookie_reserve
 
-        claimed = await self.db.claim_bet_for_resolution(bet_id, outcome)
-        if not claimed:
-            raise ValueError("Bet is already resolved.")
+        async with self.db.transaction():
+            claimed = await self.db.claim_bet_for_resolution(
+                bet_id, outcome, commit=False
+            )
+            if not claimed:
+                raise ValueError("Bet is already resolved.")
 
-        payouts: list[tuple[Wager, int]] = []
-        total_payout = 0
+            payouts: list[tuple[Wager, int]] = []
+            total_payout = 0
 
-        for wager in wagers:
-            payout = compute_payout(wager, bet, outcome)
-            if payout > 0:
-                await self.db.adjust_balance(bet.guild_id, wager.user_id, payout)
-                payouts.append((wager, payout))
-                total_payout += payout
+            for wager in wagers:
+                payout = compute_payout(wager, bet, outcome)
+                if payout > 0:
+                    await self.db.adjust_balance(
+                        bet.guild_id, wager.user_id, payout, commit=False
+                    )
+                    payouts.append((wager, payout))
+                    total_payout += payout
 
-        # Escrow funds the pool; bookie nets (escrow - payouts) plus locked reserve returned.
-        bookie_settlement = escrow_balance - total_payout + bookie_reserve
-        await self.db.adjust_balance_allow_negative(
-            bet.guild_id, bet.creator_id, bookie_settlement
-        )
-        await self.db.set_bet_escrow(bet.id, 0, 0)
+            bookie_settlement = escrow_balance - total_payout + bookie_reserve
+            await self.db.adjust_balance_allow_negative(
+                bet.guild_id, bet.creator_id, bookie_settlement, commit=False
+            )
+            await self.db.set_bet_escrow(bet.id, 0, 0, commit=False)
 
         return claimed, payouts
 
@@ -495,17 +517,17 @@ class BetService:
             return None
 
         wagers = await self.db.get_wagers_for_bet(bet_id)
-        for wager in wagers:
-            await self.db.adjust_balance(bet.guild_id, wager.user_id, wager.amount)
-            await self.db.remove_wager(bet_id, wager.user_id)
+        bet_snapshot = bet
 
-        if bet.bookie_reserve > 0:
-            await self.db.adjust_balance(
-                bet.guild_id, bet.creator_id, bet.bookie_reserve
+        async with self.db.transaction():
+            claimed = await self.db.claim_bet_for_cancellation(
+                bet_id,
+                from_statuses=(BetStatus.CLOSED,),
+                commit=False,
             )
-        await self.db.set_bet_escrow(bet.id, 0, 0)
+            if not claimed:
+                return None
 
-        updated = await self.db.update_bet_status(bet_id, BetStatus.CANCELLED)
-        if not updated:
-            return None
-        return updated, len(wagers)
+            await self._refund_wagers_and_release_reserve(bet_snapshot, wagers)
+
+        return claimed, len(wagers)

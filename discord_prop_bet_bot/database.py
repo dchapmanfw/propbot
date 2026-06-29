@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, AsyncIterator
 
 import aiosqlite
 
@@ -94,6 +96,7 @@ class Database:
     def __init__(self, path: str = DATABASE_PATH) -> None:
         self.path = path
         self._conn: aiosqlite.Connection | None = None
+        self._txn_lock = asyncio.Lock()
 
     async def connect(self) -> None:
         self._conn = await aiosqlite.connect(self.path)
@@ -128,18 +131,55 @@ class Database:
             raise RuntimeError("Database not connected")
         return self._conn
 
-    async def ensure_user(self, guild_id: int, user_id: int) -> UserBalance:
-        """Create a user with starting balance if they do not exist yet."""
-        now_balance = await self.get_balance(guild_id, user_id)
-        if now_balance is not None:
-            return UserBalance(guild_id, user_id, now_balance)
+    @asynccontextmanager
+    async def transaction(self) -> AsyncIterator[None]:
+        """Run operations in a single atomic transaction (BEGIN IMMEDIATE)."""
+        async with self._txn_lock:
+            await self.conn.execute("BEGIN IMMEDIATE")
+            try:
+                yield
+                await self.conn.commit()
+            except Exception:
+                await self.conn.rollback()
+                raise
 
+    async def _commit_if(self, commit: bool) -> None:
+        if commit:
+            await self.conn.commit()
+
+    async def ensure_user(
+        self, guild_id: int, user_id: int, *, commit: bool = True
+    ) -> UserBalance:
+        """Create a user with starting balance if they do not exist yet."""
         await self.conn.execute(
-            "INSERT INTO users (guild_id, user_id, balance) VALUES (?, ?, ?)",
+            """
+            INSERT OR IGNORE INTO users (guild_id, user_id, balance)
+            VALUES (?, ?, ?)
+            """,
             (guild_id, user_id, STARTING_BALANCE),
         )
-        await self.conn.commit()
-        return UserBalance(guild_id, user_id, STARTING_BALANCE)
+        await self._commit_if(commit)
+        balance = await self.get_balance(guild_id, user_id)
+        assert balance is not None
+        return UserBalance(guild_id, user_id, balance)
+
+    async def ensure_users(
+        self,
+        guild_id: int,
+        user_ids: list[int],
+        *,
+        commit: bool = True,
+    ) -> None:
+        """Ensure multiple users exist (single round-trip per id, one commit)."""
+        for user_id in user_ids:
+            await self.conn.execute(
+                """
+                INSERT OR IGNORE INTO users (guild_id, user_id, balance)
+                VALUES (?, ?, ?)
+                """,
+                (guild_id, user_id, STARTING_BALANCE),
+            )
+        await self._commit_if(commit)
 
     async def get_balance(self, guild_id: int, user_id: int) -> int | None:
         cursor = await self.conn.execute(
@@ -149,9 +189,16 @@ class Database:
         row = await cursor.fetchone()
         return int(row["balance"]) if row else None
 
-    async def adjust_balance(self, guild_id: int, user_id: int, delta: int) -> int:
+    async def adjust_balance(
+        self,
+        guild_id: int,
+        user_id: int,
+        delta: int,
+        *,
+        commit: bool = True,
+    ) -> int:
         """Atomically adjust balance. Raises ValueError if result would be negative."""
-        await self.ensure_user(guild_id, user_id)
+        await self.ensure_user(guild_id, user_id, commit=False)
         cursor = await self.conn.execute(
             """
             UPDATE users
@@ -162,16 +209,21 @@ class Database:
         )
         if cursor.rowcount == 0:
             raise ValueError("Insufficient balance")
-        await self.conn.commit()
+        await self._commit_if(commit)
         balance = await self.get_balance(guild_id, user_id)
         assert balance is not None
         return balance
 
     async def adjust_balance_allow_negative(
-        self, guild_id: int, user_id: int, delta: int
+        self,
+        guild_id: int,
+        user_id: int,
+        delta: int,
+        *,
+        commit: bool = True,
     ) -> int:
         """Adjust balance without a floor (used for bookie settlement)."""
-        await self.ensure_user(guild_id, user_id)
+        await self.ensure_user(guild_id, user_id, commit=False)
         await self.conn.execute(
             """
             UPDATE users
@@ -180,13 +232,18 @@ class Database:
             """,
             (delta, guild_id, user_id),
         )
-        await self.conn.commit()
+        await self._commit_if(commit)
         balance = await self.get_balance(guild_id, user_id)
         assert balance is not None
         return balance
 
     async def set_bet_escrow(
-        self, bet_id: int, escrow_balance: int, bookie_reserve: int
+        self,
+        bet_id: int,
+        escrow_balance: int,
+        bookie_reserve: int,
+        *,
+        commit: bool = True,
     ) -> None:
         await self.conn.execute(
             """
@@ -196,7 +253,7 @@ class Database:
             """,
             (escrow_balance, bookie_reserve, bet_id),
         )
-        await self.conn.commit()
+        await self._commit_if(commit)
 
     async def create_bet(
         self,
@@ -258,16 +315,22 @@ class Database:
         bet_id: int,
         status: BetStatus,
         outcome: BetOutcome | None = None,
+        *,
+        commit: bool = True,
     ) -> Bet | None:
         await self.conn.execute(
             "UPDATE bets SET status = ?, outcome = ? WHERE id = ?",
             (status.value, outcome.value if outcome else None, bet_id),
         )
-        await self.conn.commit()
+        await self._commit_if(commit)
         return await self.get_bet(bet_id)
 
     async def claim_bet_for_resolution(
-        self, bet_id: int, outcome: BetOutcome
+        self,
+        bet_id: int,
+        outcome: BetOutcome,
+        *,
+        commit: bool = True,
     ) -> Bet | None:
         """Atomically mark a closed bet resolved; returns None if not claimable."""
         cursor = await self.conn.execute(
@@ -283,7 +346,36 @@ class Database:
                 BetStatus.CLOSED.value,
             ),
         )
-        await self.conn.commit()
+        await self._commit_if(commit)
+        if cursor.rowcount == 0:
+            return None
+        return await self.get_bet(bet_id)
+
+    async def claim_bet_for_cancellation(
+        self,
+        bet_id: int,
+        *,
+        from_statuses: tuple[BetStatus, ...] = (
+            BetStatus.OPEN,
+            BetStatus.CLOSED,
+        ),
+        commit: bool = True,
+    ) -> Bet | None:
+        """Atomically mark a bet cancelled; returns None if not claimable."""
+        placeholders = ",".join("?" * len(from_statuses))
+        cursor = await self.conn.execute(
+            f"""
+            UPDATE bets
+            SET status = ?, outcome = NULL
+            WHERE id = ? AND status IN ({placeholders})
+            """,
+            (
+                BetStatus.CANCELLED.value,
+                bet_id,
+                *[status.value for status in from_statuses],
+            ),
+        )
+        await self._commit_if(commit)
         if cursor.rowcount == 0:
             return None
         return await self.get_bet(bet_id)
@@ -350,6 +442,8 @@ class Database:
         user_id: int,
         pick: WagerPick,
         amount: int,
+        *,
+        commit: bool = True,
     ) -> Wager:
         """Replace a user's wager on a bet (used after balance adjustment in service layer)."""
         await self.conn.execute(
@@ -362,12 +456,14 @@ class Database:
             """,
             (bet_id, user_id, pick.value, amount),
         )
-        await self.conn.commit()
+        await self._commit_if(commit)
         wager = await self.get_wager(bet_id, user_id)
         assert wager is not None
         return wager
 
-    async def remove_wager(self, bet_id: int, user_id: int) -> Wager | None:
+    async def remove_wager(
+        self, bet_id: int, user_id: int, *, commit: bool = True
+    ) -> Wager | None:
         wager = await self.get_wager(bet_id, user_id)
         if not wager:
             return None
@@ -375,8 +471,14 @@ class Database:
             "DELETE FROM wagers WHERE bet_id = ? AND user_id = ?",
             (bet_id, user_id),
         )
-        await self.conn.commit()
+        await self._commit_if(commit)
         return wager
+
+    async def remove_all_wagers_for_bet(
+        self, bet_id: int, *, commit: bool = True
+    ) -> None:
+        await self.conn.execute("DELETE FROM wagers WHERE bet_id = ?", (bet_id,))
+        await self._commit_if(commit)
 
     async def get_user_bets(
         self,
