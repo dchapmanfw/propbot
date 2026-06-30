@@ -249,6 +249,11 @@ def test_main_exits_without_token():
 
 def test_main_runs_bot():
     mock_bot = MagicMock()
-    with patch("bot.DISCORD_TOKEN", "token"), patch("bot.PropBetBot", return_value=mock_bot):
+    with (
+        patch("bot.DISCORD_TOKEN", "token"),
+        patch("bot.PropBetBot", return_value=mock_bot),
+        patch("bot.kill_other_bot_instances") as mock_kill,
+    ):
         main()
+    mock_kill.assert_called_once()
     mock_bot.run.assert_called_once_with("token")

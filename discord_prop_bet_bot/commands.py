@@ -232,7 +232,6 @@ class PropBetCommands(commands.Cog):
     def __init__(self, bot: PropBetBot) -> None:
         self.bot = bot
         self.db: Database = bot.db
-        self._reactions_reconciled = False
 
     async def _notify_user(
         self,
@@ -391,7 +390,11 @@ class PropBetCommands(commands.Cog):
         )
 
     async def _reconcile_open_bet_reactions(self) -> None:
-        """Prompt users who reacted while the bot was offline."""
+        """Prompt users who reacted while the bot was offline.
+
+        Not run on startup — that would DM everyone with stale reactions on
+        every restart. Live prompts are handled by on_raw_reaction_add.
+        """
         open_bets = await self.db.get_open_bets()
         for bet in open_bets:
             if not bet.message_id:
@@ -427,13 +430,6 @@ class PropBetCommands(commands.Cog):
                     await self._maybe_prompt_wager_for_reaction(
                         bet, user.id, pick, bet.channel_id
                     )
-
-    @commands.Cog.listener()
-    async def on_ready(self) -> None:
-        if self._reactions_reconciled:
-            return
-        self._reactions_reconciled = True
-        self.bot.loop.create_task(self._reconcile_open_bet_reactions())
 
     async def _defer(
         self, interaction: discord.Interaction, *, ephemeral: bool = False

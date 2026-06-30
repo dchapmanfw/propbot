@@ -18,6 +18,7 @@ from config import (
 from database import Database
 from markets import MarketService, build_market_embed
 from models import Bet, BetKind, BetStatus
+from process_guard import kill_other_bot_instances
 
 logging.basicConfig(
     level=logging.INFO,
@@ -197,6 +198,8 @@ def main() -> None:
         raise SystemExit(
             "DISCORD_TOKEN is not set. Copy .env.example to .env and add your bot token."
         )
+
+    kill_other_bot_instances()
 
     bot = PropBetBot()
 

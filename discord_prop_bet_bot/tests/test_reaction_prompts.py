@@ -521,15 +521,9 @@ async def test_reconcile_skips_non_wager_emojis(reaction_cog):
     cog._maybe_prompt_wager_for_reaction.assert_not_awaited()
 
 
-# --- on_ready ---
+# --- startup (no DM reconcile on boot) ---
 
 
-@pytest.mark.asyncio
-async def test_on_ready_reconciles_only_once(reaction_cog):
+def test_cog_has_no_startup_reconcile_listener(reaction_cog):
     cog, _db, _bot = reaction_cog
-    cog._reconcile_open_bet_reactions = AsyncMock()
-
-    await cog.on_ready()
-    await cog.on_ready()
-
-    cog._reconcile_open_bet_reactions.assert_awaited_once()
+    assert "on_ready" not in type(cog).__dict__
