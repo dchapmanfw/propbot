@@ -523,6 +523,23 @@ async def _open_market(db, *, creator_id=BOOKIE_ID, hours=2, message_id=4242):
 
 
 @pytest.mark.asyncio
+async def test_market_list_paths(cog, db):
+    interaction = make_interaction(guild=False)
+    await call_slash(cog, cog.market_list, interaction)
+
+    interaction = make_interaction()
+    await call_slash(cog, cog.market_list, interaction)
+    interaction.response.defer.assert_awaited_once()
+    interaction.followup.send.assert_awaited_once()
+
+    await _open_market(db)
+    interaction = make_interaction()
+    await call_slash(cog, cog.market_list, interaction)
+    interaction.response.defer.assert_awaited_once()
+    interaction.followup.send.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_market_create_validation_and_success(cog, db, bot_mock):
     interaction = make_interaction(guild=False)
     await call_slash(cog, cog.market_create, interaction, "Q?", "2h")

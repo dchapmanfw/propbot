@@ -402,6 +402,7 @@ def build_help_embed() -> discord.Embed:
             "`/bet_create` — open a prop bet (you are the bookie)\n"
             "`/market_create` — open a Polymarket-style prediction market\n"
             "`/bet_status` / `/market_status` — details and participants\n"
+            "`/market_list` — all outstanding prediction markets\n"
             "`/bet_resolve` / `/market_resolve` — settle (creator or admin)\n"
             "`/bet_cancel` / `/market_cancel` — cancel and refund\n"
             "`/market_sell` — sell prediction-market shares before close\n"

@@ -719,6 +719,24 @@ class Database:
         rows = await cursor.fetchall()
         return [_row_to_bet(row) for row in rows]
 
+    async def get_unresolved_markets(self, guild_id: int) -> list[Bet]:
+        """Open or closed prediction markets awaiting resolution in a guild."""
+        cursor = await self.conn.execute(
+            """
+            SELECT * FROM bets
+            WHERE guild_id = ? AND bet_kind = ? AND status IN (?, ?)
+            ORDER BY close_time ASC
+            """,
+            (
+                guild_id,
+                BetKind.MARKET.value,
+                BetStatus.OPEN.value,
+                BetStatus.CLOSED.value,
+            ),
+        )
+        rows = await cursor.fetchall()
+        return [_row_to_bet(row) for row in rows]
+
     async def get_expired_open_bets(self, now: datetime | None = None) -> list[Bet]:
         now = now or datetime.now(timezone.utc)
         cursor = await self.conn.execute(

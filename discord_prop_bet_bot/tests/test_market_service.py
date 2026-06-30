@@ -7,7 +7,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from lmsr import lmsr_price_yes
-from markets import MarketService
+from markets import MarketService, build_markets_list_embed
 from models import BetKind, BetOutcome, BetStatus, WagerPick
 
 
@@ -107,3 +107,12 @@ async def test_buy_shares_rejects_over_trade_cap(db, market):
 
     with pytest.raises(ValueError, match="Maximum trade size"):
         await service.buy_shares(1, market.id, 200, WagerPick.YES, 51)
+
+
+async def test_build_markets_list_embed_empty_and_populated(db, market):
+    empty = build_markets_list_embed([], guild_id=1)
+    assert "No outstanding" in empty.description
+
+    populated = build_markets_list_embed([market], guild_id=1)
+    assert "Outstanding markets (1)" in populated.title
+    assert "Will it rain?" in populated.description

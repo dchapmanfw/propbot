@@ -138,6 +138,59 @@ def _status_label(status: BetStatus) -> str:
     }[status]
 
 
+def format_market_list_line(bet: Bet, *, guild_id: int) -> str:
+    """One-line summary for an outstanding prediction market."""
+    yes_price = lmsr_price_yes(bet.q_yes, bet.q_no, bet.liquidity_b)
+    no_price = lmsr_price_no(bet.q_yes, bet.q_no, bet.liquidity_b)
+    prices = (
+        f"{YES_EMOJI} {format_price_cents(yes_price)} · "
+        f"{NO_EMOJI} {format_price_cents(no_price)}"
+    )
+    closes = discord.utils.format_dt(bet.close_time, style="R")
+    link = ""
+    if bet.message_id:
+        url = f"https://discord.com/channels/{guild_id}/{bet.channel_id}/{bet.message_id}"
+        link = f" · [jump]({url})"
+    return (
+        f"**#{bet.id}** {_status_label(bet.status)} — {bet.question}\n"
+        f"Closes {closes} · {prices}{link}"
+    )
+
+
+def build_markets_list_embed(bets: list[Bet], *, guild_id: int) -> discord.Embed:
+    """Embed listing all outstanding prediction markets in a server."""
+    if not bets:
+        return discord.Embed(
+            title="Outstanding markets",
+            description="No outstanding prediction markets in this server.",
+            color=discord.Color.teal(),
+        )
+
+    lines = [format_market_list_line(bet, guild_id=guild_id) for bet in bets]
+    description = "\n\n".join(lines)
+    overflow = ""
+    max_len = 3900
+    if len(description) > max_len:
+        kept: list[str] = []
+        length = 0
+        for line in lines:
+            extra = 2 if kept else 0
+            if length + len(line) + extra > max_len:
+                break
+            kept.append(line)
+            length += len(line) + extra
+        overflow = f"\n\n_…and {len(lines) - len(kept)} more. Use `/market_status` for details._"
+        description = "\n\n".join(kept) + overflow
+
+    embed = discord.Embed(
+        title=f"Outstanding markets ({len(bets)})",
+        description=description,
+        color=discord.Color.teal(),
+    )
+    embed.set_footer(text="Use /market_status <id> for full details and positions.")
+    return embed
+
+
 def _position_lines(positions: list[MarketPosition], limit: int = 15) -> list[str]:
     aggregated: dict[int, dict[WagerPick, float]] = {}
     for pos in positions:

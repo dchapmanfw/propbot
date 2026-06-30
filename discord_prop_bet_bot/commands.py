@@ -28,7 +28,12 @@ from config import ALLOWED_CHANNEL_ID, MAX_MARKET_TRADE_COINS, NO_EMOJI, YES_EMO
 from database import Database
 from economy import EconomyService, REDEMPTION_COST
 from lmsr import format_price_cents, lmsr_price_no, lmsr_price_yes
-from markets import MarketService, build_market_embed, format_shares
+from markets import (
+    MarketService,
+    build_market_embed,
+    build_markets_list_embed,
+    format_shares,
+)
 from models import BetKind, BetOutcome, BetStatus, WagerPick
 
 if TYPE_CHECKING:
@@ -951,6 +956,25 @@ class PropBetCommands(commands.Cog):
             await message.edit(embed=embed)
 
         self.bot.untrack_bet(bet_id)
+
+    @app_commands.command(
+        name="market_list",
+        description="List all outstanding prediction markets in this server",
+    )
+    async def market_list(self, interaction: discord.Interaction) -> None:
+        if not interaction.guild:
+            await interaction.response.send_message(
+                "This command can only be used in a server.", ephemeral=True
+            )
+            return
+        if not await self._defer(interaction):
+            return
+        if not await self._require_allowed_channel(interaction, use_followup=True):
+            return
+
+        markets = await self.db.get_unresolved_markets(interaction.guild.id)
+        embed = build_markets_list_embed(markets, guild_id=interaction.guild.id)
+        await interaction.followup.send(embed=embed)
 
     @app_commands.command(
         name="market_status",
