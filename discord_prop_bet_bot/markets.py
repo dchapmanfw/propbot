@@ -192,6 +192,51 @@ def build_markets_list_embed(bets: list[Bet], *, guild_id: int) -> discord.Embed
     return embed
 
 
+def portfolio_value_for_bet(
+    q_yes: float,
+    q_no: float,
+    liquidity_b: float,
+    positions: list[tuple[WagerPick, float]],
+) -> int:
+    """Mark-to-market coin value if all `positions` were sold at current LMSR prices."""
+    total = 0
+    for side, shares in positions:
+        if shares <= 1e-9:
+            continue
+        raw = lmsr_sell_proceeds(q_yes, q_no, side, shares, liquidity_b)
+        total += int(math.floor(raw))
+        if side == WagerPick.YES:
+            q_yes -= shares
+        else:
+            q_no -= shares
+    return total
+
+
+def portfolio_values_by_user(
+    rows: list[tuple[int, int, WagerPick, float, float, float, float]],
+) -> dict[int, int]:
+    """
+    Sum mark-to-market portfolio value per user across active markets.
+
+    Each row is (user_id, bet_id, side, shares, q_yes, q_no, liquidity_b).
+    """
+    by_user_bet: dict[int, dict[int, list[tuple[WagerPick, float]]]] = {}
+    bet_state: dict[int, tuple[float, float, float]] = {}
+
+    for user_id, bet_id, side, shares, q_yes, q_no, liquidity_b in rows:
+        by_user_bet.setdefault(user_id, {}).setdefault(bet_id, []).append((side, shares))
+        bet_state[bet_id] = (q_yes, q_no, liquidity_b)
+
+    totals: dict[int, int] = {}
+    for user_id, bets in by_user_bet.items():
+        value = 0
+        for bet_id, positions in bets.items():
+            q_yes, q_no, liquidity_b = bet_state[bet_id]
+            value += portfolio_value_for_bet(q_yes, q_no, liquidity_b, positions)
+        totals[user_id] = value
+    return totals
+
+
 def _position_lines(positions: list[MarketPosition], limit: int = 15) -> list[str]:
     aggregated: dict[int, dict[WagerPick, float]] = {}
     for pos in positions:

@@ -864,15 +864,48 @@ class Database:
         return [_row_to_bet(row) for row in rows]
 
     async def get_leaderboard(self, guild_id: int, limit: int = 10) -> list[UserBalance]:
+        from markets import portfolio_values_by_user
+
         cursor = await self.conn.execute(
             """
             SELECT guild_id, user_id, balance, reset_count
             FROM users
             WHERE guild_id = ?
-            ORDER BY reset_count ASC, balance DESC
-            LIMIT ?
             """,
-            (guild_id, limit),
+            (guild_id,),
         )
-        rows = await cursor.fetchall()
-        return [_row_to_user_balance(row) for row in rows]
+        users = [_row_to_user_balance(row) for row in await cursor.fetchall()]
+        if not users:
+            return []
+
+        cursor = await self.conn.execute(
+            """
+            SELECT mp.user_id, mp.bet_id, mp.side, mp.shares,
+                   b.q_yes, b.q_no, b.liquidity_b
+            FROM market_positions mp
+            JOIN bets b ON b.id = mp.bet_id
+            WHERE b.guild_id = ?
+              AND mp.shares > 0
+              AND b.status IN (?, ?)
+            """,
+            (guild_id, BetStatus.OPEN.value, BetStatus.CLOSED.value),
+        )
+        position_rows = [
+            (
+                int(row["user_id"]),
+                int(row["bet_id"]),
+                WagerPick(row["side"]),
+                float(row["shares"]),
+                float(row["q_yes"]),
+                float(row["q_no"]),
+                float(row["liquidity_b"]),
+            )
+            for row in await cursor.fetchall()
+        ]
+        portfolio_by_user = portfolio_values_by_user(position_rows)
+
+        for user in users:
+            user.portfolio_value = portfolio_by_user.get(user.user_id, 0)
+
+        users.sort(key=lambda u: (u.reset_count, -u.total_value))
+        return users[:limit]

@@ -34,6 +34,12 @@ class UserBalance:
     user_id: int
     balance: int
     reset_count: int = 0
+    portfolio_value: int = 0
+
+    @property
+    def total_value(self) -> int:
+        """Liquid balance plus mark-to-market value of open market holdings."""
+        return self.balance + self.portfolio_value
 
 
 @dataclass

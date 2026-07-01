@@ -151,3 +151,29 @@ async def test_leaderboard_among_resetters_fewer_resets_rank_higher(db: Database
     assert board[0].reset_count == 1
     assert board[1].user_id == 2
     assert board[1].reset_count == 2
+
+
+@pytest.mark.asyncio
+async def test_leaderboard_ranks_by_total_wealth(db: Database):
+    from markets import MarketService
+
+    service = MarketService(db)
+    await db.ensure_user(1, 1)
+    await db.ensure_user(1, 2)
+    await db.adjust_balance(1, 1, -900)  # 100 liquid
+
+    close = datetime.now(timezone.utc) + timedelta(hours=2)
+    market = await service.create_market(
+        guild_id=1,
+        channel_id=10,
+        creator_id=100,
+        question="Will it rain?",
+        close_time=close,
+    )
+    await service.buy_shares(1, market.id, 2, WagerPick.YES, 50)
+
+    board = await db.get_leaderboard(1)
+    user2 = next(row for row in board if row.user_id == 2)
+    assert user2.portfolio_value > 0
+    assert user2.total_value > 100
+    assert board[0].user_id == 2

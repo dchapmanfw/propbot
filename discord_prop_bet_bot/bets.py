@@ -211,6 +211,16 @@ def format_balance_message(user: UserBalance) -> str:
     return "\n".join(lines)
 
 
+def format_leaderboard_wealth(row: UserBalance) -> str:
+    """Format liquid + portfolio breakdown as A + B = C."""
+    if row.portfolio_value > 0:
+        return (
+            f"**{row.balance}** + **{row.portfolio_value}** "
+            f"= **{row.total_value}** coins"
+        )
+    return f"**{row.total_value}** coins"
+
+
 def build_leaderboard_description(rows: list[UserBalance]) -> str:
     """Format leaderboard rows with anti-prestige markers and optional tier headers."""
     medals = ["🥇", "🥈", "🥉"]
@@ -232,7 +242,7 @@ def build_leaderboard_description(rows: list[UserBalance]) -> str:
         prefix = medals[idx] if idx < 3 else f"{idx + 1}."
         prestige = format_anti_prestige(row.reset_count)
         lines.append(
-            f"{prefix} <@{row.user_id}> — **{row.balance}** coins{prestige}"
+            f"{prefix} <@{row.user_id}> — {format_leaderboard_wealth(row)}{prestige}"
         )
 
     return "\n".join(lines)
@@ -408,7 +418,7 @@ def build_help_embed() -> discord.Embed:
             "`/market_bet` — DM yourself YES/NO buy buttons for a market\n"
             "`/market_sell` — sell prediction-market shares before close\n"
             "`/my_bets` — your recent and active bets\n"
-            "`/leaderboard` — top balances in this server\n"
+            "`/leaderboard` — top total wealth (cash + market holdings)\n"
             "`/reset` — bail out to starting cash (adds anti-prestige ↩️)\n"
             "`/redeem` — pay 2× starting balance to clear one ↩️\n"
             "`/help` — show this guide"

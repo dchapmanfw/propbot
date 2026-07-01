@@ -8,7 +8,10 @@ $targets = Get-CimInstance Win32_Process |
     Where-Object {
         $_.Name -in @("python.exe", "python3.exe", "pythonw.exe") -and
         $_.CommandLine -and
-        $_.CommandLine -like "*$BotScript*"
+        (
+            $_.CommandLine -like "*$BotScript*" -or
+            $_.CommandLine -match '(?:^|\s|")bot\.py(?:\s|$|")'
+        )
     }
 
 if (-not $targets) {

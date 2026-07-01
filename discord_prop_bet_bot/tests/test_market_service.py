@@ -7,7 +7,12 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from lmsr import lmsr_price_yes
-from markets import MarketService, build_markets_list_embed
+from markets import (
+    MarketService,
+    build_markets_list_embed,
+    portfolio_value_for_bet,
+    portfolio_values_by_user,
+)
 from models import BetKind, BetOutcome, BetStatus, WagerPick
 
 
@@ -107,6 +112,33 @@ async def test_buy_shares_rejects_over_trade_cap(db, market):
 
     with pytest.raises(ValueError, match="Maximum trade size"):
         await service.buy_shares(1, market.id, 200, WagerPick.YES, 51)
+
+
+async def test_portfolio_value_for_bet_matches_sequential_sell(db, market):
+    service = MarketService(db)
+    await db.ensure_user(1, 200)
+    _, _, shares = await service.buy_shares(1, market.id, 200, WagerPick.YES, 50)
+    updated = await db.get_bet(market.id)
+    assert updated is not None
+
+    value = portfolio_value_for_bet(
+        updated.q_yes,
+        updated.q_no,
+        updated.liquidity_b,
+        [(WagerPick.YES, shares)],
+    )
+    assert value > 0
+    assert value <= 50
+
+
+def test_portfolio_values_by_user_aggregates_per_market():
+    rows = [
+        (10, 1, WagerPick.YES, 5.0, 5.0, 0.0, 100.0),
+        (10, 2, WagerPick.NO, 3.0, 5.0, 3.0, 100.0),
+    ]
+    totals = portfolio_values_by_user(rows)
+    assert totals == {10: portfolio_value_for_bet(5.0, 0.0, 100.0, [(WagerPick.YES, 5.0)])
+                      + portfolio_value_for_bet(5.0, 3.0, 100.0, [(WagerPick.NO, 3.0)])}
 
 
 async def test_build_markets_list_embed_empty_and_populated(db, market):

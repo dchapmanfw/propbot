@@ -1373,7 +1373,10 @@ class PropBetCommands(commands.Cog):
         )
         await interaction.followup.send(embed=embed)
 
-    @app_commands.command(name="leaderboard", description="Top balances in this server")
+    @app_commands.command(
+        name="leaderboard",
+        description="Top total wealth in this server (cash + market holdings)",
+    )
     async def leaderboard(self, interaction: discord.Interaction) -> None:
         if not interaction.guild:
             await interaction.response.send_message(
@@ -1398,7 +1401,10 @@ class PropBetCommands(commands.Cog):
             color=discord.Color.gold(),
         )
         embed.set_footer(
-            text="Ranked by prestige (no resets first), then balance. ↩️ = bailout count."
+            text=(
+                "Ranked by prestige (no resets first), then total wealth "
+                "(cash + market holdings at current prices). ↩️ = bailout count."
+            )
         )
         await interaction.followup.send(embed=embed)
 
