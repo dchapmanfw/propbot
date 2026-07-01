@@ -19,6 +19,7 @@ from bets import (
     build_leaderboard_description,
     compute_max_wager,
     emoji_from_pick,
+    ensure_yes_no_reactions,
     format_balance_message,
     parse_duration,
     pick_from_emoji,
@@ -188,6 +189,47 @@ class MarketBuyButtonView(discord.ui.View):
     ) -> None:
         await interaction.response.send_modal(
             MarketBuyModal(self.bot, self.bet_id, self.pick, self.guild_id)
+        )
+
+
+class MarketBetPickView(discord.ui.View):
+    """YES/NO buttons that open the market buy modal (used by /market_bet)."""
+
+    def __init__(
+        self,
+        bot: PropBetBot,
+        bet_id: int,
+        guild_id: int,
+        owner_id: int,
+    ) -> None:
+        super().__init__(timeout=300)
+        self.bot = bot
+        self.bet_id = bet_id
+        self.guild_id = guild_id
+        self.owner_id = owner_id
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message(
+                "This prompt is not for you.", ephemeral=True
+            )
+            return False
+        return True
+
+    @discord.ui.button(label="Buy YES", emoji=YES_EMOJI, style=discord.ButtonStyle.primary)
+    async def buy_yes(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        await interaction.response.send_modal(
+            MarketBuyModal(self.bot, self.bet_id, WagerPick.YES, self.guild_id)
+        )
+
+    @discord.ui.button(label="Buy NO", emoji=NO_EMOJI, style=discord.ButtonStyle.secondary)
+    async def buy_no(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        await interaction.response.send_modal(
+            MarketBuyModal(self.bot, self.bet_id, WagerPick.NO, self.guild_id)
         )
 
 
@@ -460,7 +502,8 @@ class PropBetCommands(commands.Cog):
         self, interaction: discord.Interaction, *, use_followup: bool = False
     ) -> bool:
         """Reject slash commands used outside the configured betting channel."""
-        if is_allowed_channel(interaction.channel_id):
+        parent_id = getattr(interaction.channel, "parent_id", None)
+        if is_allowed_channel(interaction.channel_id, parent_id=parent_id):
             return True
         msg = allowed_channel_message()
         if use_followup:
@@ -468,6 +511,17 @@ class PropBetCommands(commands.Cog):
         else:
             await interaction.response.send_message(msg, ephemeral=True)
         return False
+
+    async def _reaction_channel_allowed(self, channel_id: int) -> bool:
+        """Whether reaction events from this channel should be handled."""
+        if is_allowed_channel(channel_id):
+            return True
+        try:
+            channel = await self.bot.fetch_channel(channel_id)
+        except discord.HTTPException:
+            return False
+        parent_id = getattr(channel, "parent_id", None)
+        return is_allowed_channel(channel_id, parent_id=parent_id)
 
     @app_commands.command(name="help", description="How to use the prop bet bot")
     async def help_command(self, interaction: discord.Interaction) -> None:
@@ -478,9 +532,9 @@ class PropBetCommands(commands.Cog):
             return
 
         embed = build_help_embed()
-        if (
-            ALLOWED_CHANNEL_ID is not None
-            and interaction.channel_id != ALLOWED_CHANNEL_ID
+        parent_id = getattr(interaction.channel, "parent_id", None)
+        if ALLOWED_CHANNEL_ID is not None and not is_allowed_channel(
+            interaction.channel_id, parent_id=parent_id
         ):
             embed.add_field(
                 name="Wrong channel?",
@@ -791,6 +845,84 @@ class PropBetCommands(commands.Cog):
             f"market #{bet_id}. Balance: **{balance}** coins."
         )
         await self.bot.refresh_bet_message(bet_id)
+
+    @app_commands.command(
+        name="market_bet",
+        description="Open a DM with YES/NO buttons to buy shares on a market",
+    )
+    @app_commands.describe(bet_id="The market ID to trade on")
+    async def market_bet(
+        self, interaction: discord.Interaction, bet_id: int
+    ) -> None:
+        if not interaction.guild:
+            await interaction.response.send_message(
+                "This command can only be used in a server.", ephemeral=True
+            )
+            return
+        if not await self._defer(interaction, ephemeral=True):
+            return
+        if not await self._require_allowed_channel(interaction, use_followup=True):
+            return
+
+        bet = await self.db.get_bet(bet_id)
+        if not bet or bet.guild_id != interaction.guild.id:
+            await interaction.followup.send("Market not found.", ephemeral=True)
+            return
+        if bet.bet_kind != BetKind.MARKET:
+            await interaction.followup.send(
+                "That ID is a prop bet — react on the bet message to wager.",
+                ephemeral=True,
+            )
+            return
+        if bet.status != BetStatus.OPEN:
+            await interaction.followup.send(
+                f"Market #{bet_id} is not open for trading ({bet.status.value}).",
+                ephemeral=True,
+            )
+            return
+        if datetime.now(timezone.utc) >= bet.close_time:
+            await MarketService(self.db).close_market(bet_id)
+            await self.bot.refresh_bet_message(bet_id)
+            await interaction.followup.send(
+                f"Market #{bet_id} just closed — trading is no longer available.",
+                ephemeral=True,
+            )
+            return
+
+        await self.db.ensure_user(interaction.guild.id, interaction.user.id)
+        balance = await self.db.get_balance(
+            interaction.guild.id, interaction.user.id
+        ) or 0
+        yes_price = lmsr_price_yes(bet.q_yes, bet.q_no, bet.liquidity_b)
+        no_price = lmsr_price_no(bet.q_yes, bet.q_no, bet.liquidity_b)
+
+        view = MarketBetPickView(
+            self.bot, bet_id, bet.guild_id, owner_id=interaction.user.id
+        )
+        prompt = (
+            f"**Market #{bet_id}** — {bet.question}\n"
+            f"{YES_EMOJI} **{format_price_cents(yes_price)}** · "
+            f"{NO_EMOJI} **{format_price_cents(no_price)}**\n"
+            f"Balance: **{balance}** coins · "
+            f"max **{MAX_MARKET_TRADE_COINS}** coins per buy.\n"
+            "Choose a side below to buy shares."
+        )
+
+        try:
+            await interaction.user.send(prompt, view=view)
+        except (discord.Forbidden, discord.HTTPException):
+            await interaction.followup.send(
+                f"Couldn't DM you (your DMs may be closed).\n\n{prompt}",
+                view=view,
+                ephemeral=True,
+            )
+            return
+
+        await interaction.followup.send(
+            f"Check your DMs — choose {YES_EMOJI} YES or {NO_EMOJI} NO to buy shares "
+            f"on market **#{bet_id}**.",
+            ephemeral=True,
+        )
 
     @app_commands.command(
         name="market_resolve",
@@ -1280,10 +1412,50 @@ class PropBetCommands(commands.Cog):
             return None
 
     @commands.Cog.listener()
+    async def on_thread_create(self, thread: discord.Thread) -> None:
+        """Re-add YES/NO reactions when a bet/market post becomes a thread starter.
+
+        Discord does not carry reactions onto thread starter messages, which breaks
+        reaction-based betting until the bot restores them.
+        """
+        if not is_allowed_channel(thread.id, parent_id=thread.parent_id):
+            return
+
+        starter = thread.starter_message
+        if starter is None:
+            try:
+                async for message in thread.history(limit=1, oldest_first=True):
+                    starter = message
+                    break
+            except discord.HTTPException as exc:
+                logger.warning(
+                    "Could not fetch starter message for thread %s: %s",
+                    thread.id,
+                    exc,
+                )
+                return
+
+        if starter is None or starter.author.id != self.bot.user.id:
+            return
+
+        bet = await self.db.get_bet_by_message(starter.id)
+        if not bet or bet.status != BetStatus.OPEN:
+            return
+
+        await self.db.set_bet_channel_id(bet.id, thread.id)
+        await ensure_yes_no_reactions(starter)
+        logger.info(
+            "Restored YES/NO reactions on %s #%d after thread %s was created",
+            bet.bet_kind.value,
+            bet.id,
+            thread.id,
+        )
+
+    @commands.Cog.listener()
     async def on_raw_reaction_add(self, payload: discord.RawReactionActionEvent) -> None:
         if payload.user_id == self.bot.user.id:
             return
-        if not is_allowed_channel(payload.channel_id):
+        if not await self._reaction_channel_allowed(payload.channel_id):
             return
 
         emoji = str(payload.emoji)
@@ -1305,7 +1477,7 @@ class PropBetCommands(commands.Cog):
     ) -> None:
         if payload.user_id == self.bot.user.id:
             return
-        if not is_allowed_channel(payload.channel_id):
+        if not await self._reaction_channel_allowed(payload.channel_id):
             return
 
         pick = pick_from_emoji(str(payload.emoji))

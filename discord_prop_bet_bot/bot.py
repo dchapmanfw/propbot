@@ -7,13 +7,15 @@ import logging
 import discord
 from discord.ext import commands, tasks
 
-from bets import BetService, DurationParseError, build_bet_embed, parse_duration
+from bets import BetService, DurationParseError, build_bet_embed, ensure_yes_no_reactions, parse_duration
 from commands import PropBetCommands
 from config import (
     BET_EXPIRY_CHECK_INTERVAL,
     DEV_GUILD_ID,
     DISCORD_TOKEN,
+    NO_EMOJI,
     UNRESOLVED_REFUND_AFTER,
+    YES_EMOJI,
 )
 from database import Database
 from markets import MarketService, build_market_embed
@@ -58,9 +60,31 @@ class PropBetBot(commands.Bot):
         for bet in open_bets:
             self.track_open_bet(bet)
         logger.info("Tracking %d open bet(s) after startup", len(open_bets))
+        await self._restore_open_bet_reactions(open_bets)
 
         if not self.check_expired_bets.is_running():
             self.check_expired_bets.start()
+
+    async def _restore_open_bet_reactions(self, open_bets: list[Bet]) -> None:
+        """Re-add YES/NO reactions on open bet messages (e.g. after thread creation)."""
+        restored = 0
+        for bet in open_bets:
+            if not bet.message_id:
+                continue
+            channel = await self.fetch_channel(bet.channel_id)
+            if not channel:
+                continue
+            try:
+                message = await channel.fetch_message(bet.message_id)
+            except discord.NotFound:
+                continue
+            before = {str(r.emoji) for r in message.reactions}
+            await ensure_yes_no_reactions(message)
+            after = before | {YES_EMOJI, NO_EMOJI}
+            if after != before:
+                restored += 1
+        if restored:
+            logger.info("Restored YES/NO reactions on %d open bet message(s)", restored)
 
     async def _sync_slash_commands(self) -> None:
         """Register slash commands with Discord (guild sync is instant for dev)."""
@@ -152,6 +176,8 @@ class PropBetBot(commands.Bot):
                 bookie_balance=bookie_balance,
             )
         await message.edit(embed=embed)
+        if bet.status == BetStatus.OPEN:
+            await ensure_yes_no_reactions(message)
 
     @tasks.loop(seconds=BET_EXPIRY_CHECK_INTERVAL)
     async def check_expired_bets(self) -> None:

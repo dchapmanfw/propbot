@@ -13,6 +13,7 @@ from discord import app_commands
 import channel_policy as cp
 from bets import BetService
 from commands import (
+    MarketBetPickView,
     MarketBuyButtonView,
     MarketBuyModal,
     PropBetCommands,
@@ -570,6 +571,65 @@ async def test_market_buy_modal(cog, db, bot_mock):
 
 
 @pytest.mark.asyncio
+async def test_market_bet_sends_dm(cog, db, bot_mock):
+    bet_id = await _open_market(db)
+    await db.ensure_user(1, BETTOR_ID)
+
+    interaction = make_interaction(user_id=BETTOR_ID)
+    interaction.user.send = AsyncMock()
+
+    await call_slash(cog, cog.market_bet, interaction, bet_id)
+
+    interaction.response.defer.assert_awaited_once()
+    interaction.user.send.assert_awaited_once()
+    sent_view = interaction.user.send.await_args.kwargs["view"]
+    assert isinstance(sent_view, MarketBetPickView)
+    interaction.followup.send.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_market_bet_falls_back_when_dm_blocked(cog, db, bot_mock):
+    bet_id = await _open_market(db)
+    await db.ensure_user(1, BETTOR_ID)
+
+    interaction = make_interaction(user_id=BETTOR_ID)
+    interaction.user.send = AsyncMock(
+        side_effect=discord.Forbidden(MagicMock(), "closed DMs")
+    )
+
+    await call_slash(cog, cog.market_bet, interaction, bet_id)
+
+    interaction.followup.send.assert_awaited_once()
+    assert interaction.followup.send.await_args.kwargs.get("view") is not None
+
+
+@pytest.mark.asyncio
+async def test_market_bet_rejects_prop_bet(cog, db):
+    bet_id = await _open_bet(db)
+    interaction = make_interaction(user_id=BETTOR_ID)
+    await call_slash(cog, cog.market_bet, interaction, bet_id)
+    interaction.followup.send.assert_awaited_once()
+    assert "prop bet" in interaction.followup.send.await_args.args[0].lower()
+
+
+@pytest.mark.asyncio
+async def test_market_bet_pick_view_opens_modal(cog, db):
+    bet_id = await _open_market(db)
+    view = MarketBetPickView(cog.bot, bet_id, 1, owner_id=BETTOR_ID)
+    interaction = AsyncMock()
+    interaction.user.id = BETTOR_ID
+    interaction.response = AsyncMock()
+    interaction.response.send_modal = AsyncMock()
+
+    await view.children[0].callback(interaction)
+
+    interaction.response.send_modal.assert_awaited_once()
+    modal = interaction.response.send_modal.await_args.args[0]
+    assert isinstance(modal, MarketBuyModal)
+    assert modal.pick == WagerPick.YES
+
+
+@pytest.mark.asyncio
 async def test_market_sell_and_status(cog, db, bot_mock):
     bet_id = await _open_market(db)
     await db.ensure_user(1, BETTOR_ID)
@@ -659,3 +719,59 @@ async def test_market_reaction_remove_is_noop(cog, db, bot_mock):
     )
     await cog.on_raw_reaction_remove(payload)
     bot_mock.refresh_bet_message.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_on_thread_create_restores_reactions_for_open_bet(cog, db, bot_mock):
+    bet_id = await _open_market(db)
+    await db.set_bet_message_id(bet_id, 9001)
+
+    starter = MagicMock()
+    starter.id = 9001
+    starter.author = MagicMock()
+    starter.author.id = bot_mock.user.id
+    starter.reactions = []
+    starter.add_reaction = AsyncMock()
+
+    thread = MagicMock(spec=discord.Thread)
+    thread.id = 8888
+    thread.parent_id = CHANNEL_ID
+    thread.starter_message = starter
+    thread.history = MagicMock(return_value=_async_iter([]))
+
+    await cog.on_thread_create(thread)
+
+    bet = await db.get_bet(bet_id)
+    assert bet.channel_id == 8888
+    assert starter.add_reaction.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_reaction_add_allowed_in_thread_under_configured_channel(
+    cog, db, bot_mock, monkeypatch
+):
+    monkeypatch.setattr(cp, "ALLOWED_CHANNEL_ID", CHANNEL_ID)
+    bet_id = await _open_market(db)
+    await db.set_bet_message_id(bet_id, 4242)
+
+    thread_channel = MagicMock()
+    thread_channel.parent_id = CHANNEL_ID
+    bot_mock.fetch_channel = AsyncMock(return_value=thread_channel)
+
+    cog._maybe_prompt_wager_for_reaction = AsyncMock()
+    payload = SimpleNamespace(
+        user_id=BETTOR_ID,
+        channel_id=8888,
+        message_id=4242,
+        emoji=YES_EMOJI,
+    )
+    await cog.on_raw_reaction_add(payload)
+    cog._maybe_prompt_wager_for_reaction.assert_awaited_once()
+
+
+def _async_iter(items):
+    async def _gen():
+        for item in items:
+            yield item
+
+    return _gen()

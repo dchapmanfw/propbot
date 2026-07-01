@@ -405,6 +405,7 @@ def build_help_embed() -> discord.Embed:
             "`/market_list` — all outstanding prediction markets\n"
             "`/bet_resolve` / `/market_resolve` — settle (creator or admin)\n"
             "`/bet_cancel` / `/market_cancel` — cancel and refund\n"
+            "`/market_bet` — DM yourself YES/NO buy buttons for a market\n"
             "`/market_sell` — sell prediction-market shares before close\n"
             "`/my_bets` — your recent and active bets\n"
             "`/leaderboard` — top balances in this server\n"
@@ -419,7 +420,8 @@ def build_help_embed() -> discord.Embed:
         name="Prediction markets (Polymarket-style)",
         value=(
             "`/market_create question:\"Will X happen?\" duration:2h`\n"
-            "Prices move with demand — react ✅/❌ to **buy** shares at the current price.\n"
+            "Prices move with demand — react ✅/❌ to **buy** shares, or use `/market_bet` "
+            "for YES/NO buttons in your DMs.\n"
             f"Max **{MAX_MARKET_TRADE_COINS}** coins per buy. Each winning share pays **1 coin** "
             "at resolution. Sell early with `/market_sell`.\n"
             "No bookie needed — the market uses automated LMSR pricing."
@@ -695,3 +697,15 @@ class BetService:
             await self._refund_wagers_and_release_reserve(bet_snapshot, wagers)
 
         return claimed, len(wagers)
+
+
+async def ensure_yes_no_reactions(message: discord.Message) -> None:
+    """Add YES/NO reactions if missing (e.g. after a message becomes a thread starter)."""
+    existing = {str(reaction.emoji) for reaction in message.reactions}
+    for emoji in (YES_EMOJI, NO_EMOJI):
+        if emoji in existing:
+            continue
+        try:
+            await message.add_reaction(emoji)
+        except discord.HTTPException:
+            pass

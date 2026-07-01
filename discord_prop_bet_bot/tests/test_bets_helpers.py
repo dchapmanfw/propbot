@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import discord
 import pytest
@@ -17,6 +17,7 @@ from bets import (
     build_help_embed,
     compute_max_wager,
     emoji_from_pick,
+    ensure_yes_no_reactions,
     parse_duration,
     pick_from_emoji,
     status_label,
@@ -140,3 +141,29 @@ def test_build_help_embed_without_allowed_channel(monkeypatch):
     monkeypatch.setattr(bets_module, "ALLOWED_CHANNEL_ID", None)
     embed = build_help_embed()
     assert "any channel" in str(embed.to_dict()).lower()
+
+
+@pytest.mark.asyncio
+async def test_ensure_yes_no_reactions_adds_missing_emojis():
+    message = MagicMock()
+    message.reactions = []
+    message.add_reaction = AsyncMock()
+
+    await ensure_yes_no_reactions(message)
+
+    assert message.add_reaction.await_count == 2
+    added = [call.args[0] for call in message.add_reaction.await_args_list]
+    assert added == [YES_EMOJI, NO_EMOJI]
+
+
+@pytest.mark.asyncio
+async def test_ensure_yes_no_reactions_skips_existing():
+    existing = MagicMock()
+    existing.emoji = YES_EMOJI
+    message = MagicMock()
+    message.reactions = [existing]
+    message.add_reaction = AsyncMock()
+
+    await ensure_yes_no_reactions(message)
+
+    message.add_reaction.assert_awaited_once_with(NO_EMOJI)

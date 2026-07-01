@@ -629,6 +629,13 @@ class Database:
         )
         await self.conn.commit()
 
+    async def set_bet_channel_id(self, bet_id: int, channel_id: int) -> None:
+        await self.conn.execute(
+            "UPDATE bets SET channel_id = ? WHERE id = ?",
+            (channel_id, bet_id),
+        )
+        await self.conn.commit()
+
     async def get_bet(self, bet_id: int) -> Bet | None:
         cursor = await self.conn.execute("SELECT * FROM bets WHERE id = ?", (bet_id,))
         row = await cursor.fetchone()

@@ -114,7 +114,8 @@ def build_market_embed(
         embed.add_field(
             name="How to trade",
             value=(
-                f"React {YES_EMOJI} or {NO_EMOJI} to **buy** shares at the current price.\n"
+                f"React {YES_EMOJI} or {NO_EMOJI} to **buy** shares at the current price, "
+                "or use `/market_bet` for YES/NO buttons in your DMs.\n"
                 f"Max **{MAX_MARKET_TRADE_COINS}** coins per buy · "
                 "use `/market_sell` to sell before close.\n"
                 "Each winning share pays **1 coin** at resolution."

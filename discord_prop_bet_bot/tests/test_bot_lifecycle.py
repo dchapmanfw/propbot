@@ -131,6 +131,8 @@ async def test_refresh_bet_message_edits_embed(bot, db):
 
     message = MagicMock()
     message.edit = AsyncMock()
+    message.reactions = []
+    message.add_reaction = AsyncMock()
     channel = MagicMock()
     channel.fetch_message = AsyncMock(return_value=message)
     channel.guild = MagicMock()
@@ -158,6 +160,8 @@ async def test_refresh_market_message_edits_embed(bot, db):
 
     message = MagicMock()
     message.edit = AsyncMock()
+    message.reactions = []
+    message.add_reaction = AsyncMock()
     channel = MagicMock()
     channel.fetch_message = AsyncMock(return_value=message)
     channel.guild = MagicMock()
