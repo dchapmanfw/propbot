@@ -857,7 +857,7 @@ class PropBetCommands(commands.Cog):
         bet = await self.db.get_bet(bet.id)
         assert bet is not None
         self.bot.track_open_bet(bet)
-        await self.bot.refresh_market_board_message(bet.id)
+        await self.bot.refresh_market_board_for_bet(bet.id)
 
     @app_commands.command(
         name="market_sell",
@@ -1120,7 +1120,7 @@ class PropBetCommands(commands.Cog):
         if message:
             await message.edit(embed=embed)
 
-        await self.bot.refresh_market_board_message(bet_id)
+        await self.bot.refresh_market_board_for_bet(bet_id)
         self.bot.untrack_bet(bet_id)
 
     @app_commands.command(
@@ -1536,7 +1536,7 @@ class PropBetCommands(commands.Cog):
         if message:
             await message.edit(embed=embed)
 
-        await self.bot.refresh_market_board_message(bet_id)
+        await self.bot.refresh_market_board_for_bet(bet_id)
         self.bot.untrack_bet(bet_id)
 
     @commands.Cog.listener()

@@ -20,7 +20,7 @@ from config import (
     YES_EMOJI,
 )
 from database import Database
-from market_charts import build_market_analysis_embed
+from market_charts import build_market_board_embeds, build_market_board_list_embed
 from markets import MarketService, build_market_embed
 from models import Bet, BetKind, BetStatus
 from process_guard import kill_other_bot_instances
@@ -75,8 +75,11 @@ class PropBetBot(commands.Bot):
             self.check_expired_bets.start()
 
         if MARKET_BOARD_CHANNEL_ID is not None:
-            for bet in await self.db.get_active_markets_for_board():
-                await self.refresh_market_board_message(bet.id)
+            from datetime import datetime, timezone
+
+            cutoff = datetime.now(timezone.utc) - self._market_board_retention
+            for guild_id in await self.db.get_guild_ids_with_board_markets(cutoff):
+                await self.refresh_market_board(guild_id)
 
     async def _restore_open_bet_reactions(self, open_bets: list[Bet]) -> None:
         """Re-add YES/NO reactions on open bet messages (e.g. after thread creation)."""
@@ -193,40 +196,108 @@ class PropBetBot(commands.Bot):
             await ensure_yes_no_reactions(message)
 
         if bet.bet_kind == BetKind.MARKET:
-            await self.refresh_market_board_message(bet_id)
+            await self.refresh_market_board_for_bet(bet_id)
 
-    async def refresh_market_board_message(self, bet_id: int) -> None:
-        """Post or update the live analysis embed in the market board channel."""
-        if MARKET_BOARD_CHANNEL_ID is None:
-            return
-
+    async def refresh_market_board_for_bet(self, bet_id: int) -> None:
+        """Refresh the guild board after a change to one market."""
         bet = await self.db.get_bet(bet_id)
         if not bet or bet.bet_kind != BetKind.MARKET:
             return
+        await self.refresh_market_board(bet.guild_id)
+
+    async def _delete_board_message(
+        self,
+        channel: discord.abc.Messageable,
+        message_id: int,
+        guild_id: int,
+    ) -> None:
+        try:
+            message = await channel.fetch_message(message_id)
+            await message.delete()
+        except discord.NotFound:
+            pass
+        except discord.HTTPException as exc:
+            logger.warning(
+                "Could not delete market board message %s for guild %s: %s",
+                message_id,
+                guild_id,
+                exc,
+            )
+
+    async def refresh_market_board(self, guild_id: int) -> None:
+        """Post or update market board message(s) for a guild; drop stale pages."""
+        if MARKET_BOARD_CHANNEL_ID is None:
+            return
+
+        from datetime import datetime, timezone
 
         channel = await self.fetch_channel(MARKET_BOARD_CHANNEL_ID)
         if not channel:
             return
 
-        snapshots = await self.db.get_market_snapshots(bet_id)
-        embed = build_market_analysis_embed(
-            bet, snapshots, guild_id=bet.guild_id
-        )
+        cutoff = datetime.now(timezone.utc) - self._market_board_retention
+        markets = await self.db.get_markets_for_board(guild_id, cutoff)
+        entries: list[tuple] = []
+        for market in markets:
+            snapshots = await self.db.get_market_snapshots(market.id)
+            entries.append((market, snapshots))
 
-        if bet.board_message_id:
-            try:
-                message = await channel.fetch_message(bet.board_message_id)
-            except discord.NotFound:
-                await self.db.clear_bet_board_message_id(bet.id)
-            else:
-                await message.edit(embed=embed)
-                return
+        embeds = build_market_board_embeds(entries, guild_id=guild_id)
+        list_embed = build_market_board_list_embed(entries, guild_id=guild_id)
+        existing_ids = await self.db.get_market_board_message_ids(guild_id)
+        list_message_id = await self.db.get_market_board_list_message_id(guild_id)
 
-        if bet.status not in (BetStatus.OPEN, BetStatus.CLOSED):
+        if not embeds:
+            if list_message_id:
+                await self._delete_board_message(channel, list_message_id, guild_id)
+                await self.db.clear_market_board_list_message_id(guild_id)
+            for message_id in existing_ids:
+                await self._delete_board_message(channel, message_id, guild_id)
+            await self.db.clear_market_board_message_ids(guild_id)
             return
 
-        message = await channel.send(embed=embed)
-        await self.db.set_bet_board_message_id(bet.id, message.id)
+        list_message = await self._upsert_board_message(
+            channel,
+            list_message_id,
+            list_embed,
+            guild_id=guild_id,
+        )
+        await self.db.set_market_board_list_message_id(guild_id, list_message.id)
+
+        new_ids: list[int] = []
+        for page_index, embed in enumerate(embeds):
+            message_id = (
+                existing_ids[page_index] if page_index < len(existing_ids) else None
+            )
+            message = await self._upsert_board_message(
+                channel,
+                message_id,
+                embed,
+                guild_id=guild_id,
+            )
+            new_ids.append(message.id)
+
+        for message_id in existing_ids[len(embeds) :]:
+            await self._delete_board_message(channel, message_id, guild_id)
+
+        await self.db.set_market_board_message_ids(guild_id, new_ids)
+
+    async def _upsert_board_message(
+        self,
+        channel: discord.abc.Messageable,
+        message_id: int | None,
+        embed: discord.Embed,
+        *,
+        guild_id: int,
+    ) -> discord.Message:
+        if message_id:
+            try:
+                message = await channel.fetch_message(message_id)
+            except discord.NotFound:
+                return await channel.send(embed=embed)
+            await message.edit(embed=embed)
+            return message
+        return await channel.send(embed=embed)
 
     async def _purge_stale_market_board_messages(self) -> None:
         if MARKET_BOARD_CHANNEL_ID is None:
@@ -235,28 +306,9 @@ class PropBetBot(commands.Bot):
         from datetime import datetime, timezone
 
         purge_before = datetime.now(timezone.utc) - self._market_board_retention
-        channel = await self.fetch_channel(MARKET_BOARD_CHANNEL_ID)
-        if not channel:
-            return
-
-        for bet in await self.db.get_stale_board_markets(purge_before):
-            if bet.board_message_id:
-                try:
-                    message = await channel.fetch_message(bet.board_message_id)
-                except discord.NotFound:
-                    pass
-                else:
-                    try:
-                        await message.delete()
-                    except discord.HTTPException as exc:
-                        logger.warning(
-                            "Could not delete board message for market #%s: %s",
-                            bet.id,
-                            exc,
-                        )
-                        continue
-            await self.db.clear_bet_board_message_id(bet.id)
-            logger.info("Removed stale market board post for market #%d", bet.id)
+        guild_ids = await self.db.get_guild_ids_needing_board_refresh(purge_before)
+        for guild_id in guild_ids:
+            await self.refresh_market_board(guild_id)
 
     @tasks.loop(seconds=BET_EXPIRY_CHECK_INTERVAL)
     async def check_expired_bets(self) -> None:

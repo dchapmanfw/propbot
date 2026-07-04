@@ -669,9 +669,9 @@ async def test_market_analysis_paths(cog, db):
     interaction.followup.send.assert_awaited_once()
     embed = interaction.followup.send.await_args.kwargs["embed"]
     assert embed.title == f"Market #{bet_id}"
-    assert "first trade" in next(
-        field.value for field in embed.fields if field.name == "Trend"
-    )
+    trend_field = next(field for field in embed.fields if field.name == "Trend")
+    assert "first trade" in trend_field.value
+    assert embed.image.url is None
 
     prop_id = await _open_bet(db)
     interaction = make_interaction()
@@ -684,7 +684,8 @@ async def test_market_analysis_paths(cog, db):
     await call_slash(cog, cog.market_analysis, interaction, bet_id)
     embed = interaction.followup.send.await_args.kwargs["embed"]
     trend_field = next(field for field in embed.fields if field.name == "Trend")
-    assert "`" in trend_field.value
+    assert "```ansi" in trend_field.value
+    assert "YES" in trend_field.value
 
 
 @pytest.mark.asyncio

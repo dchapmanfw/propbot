@@ -62,7 +62,6 @@ class Bet:
     q_yes: float = 0.0
     q_no: float = 0.0
     liquidity_b: float = 100.0
-    board_message_id: int | None = None
     resolved_at: datetime | None = None
 
 

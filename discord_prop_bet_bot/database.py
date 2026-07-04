@@ -106,11 +106,6 @@ def _row_to_bet(row: aiosqlite.Row) -> Bet:
         q_yes=float(row["q_yes"]) if "q_yes" in keys else 0.0,
         q_no=float(row["q_no"]) if "q_no" in keys else 0.0,
         liquidity_b=float(row["liquidity_b"]) if "liquidity_b" in keys else 100.0,
-        board_message_id=(
-            int(row["board_message_id"]) if row["board_message_id"] is not None else None
-        )
-        if "board_message_id" in keys
-        else None,
         resolved_at=(
             _parse_dt(row["resolved_at"]) if row["resolved_at"] is not None else None
         )
@@ -257,14 +252,97 @@ class Database:
             """
         )
 
-        if "board_message_id" not in columns:
-            await self.conn.execute(
-                "ALTER TABLE bets ADD COLUMN board_message_id INTEGER"
+        await self.conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS market_board_messages (
+                guild_id INTEGER NOT NULL,
+                page_index INTEGER NOT NULL,
+                message_id INTEGER NOT NULL,
+                PRIMARY KEY (guild_id, page_index)
             )
+            """
+        )
+
+        await self._migrate_market_board_messages()
+
+        await self.conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS market_board_list_messages (
+                guild_id INTEGER PRIMARY KEY,
+                message_id INTEGER NOT NULL
+            )
+            """
+        )
+
         if "resolved_at" not in columns:
             await self.conn.execute(
                 "ALTER TABLE bets ADD COLUMN resolved_at TEXT"
             )
+
+        await self._backfill_market_open_snapshots()
+
+    async def _migrate_market_board_messages(self) -> None:
+        """Upgrade single-message board table to multi-page schema."""
+        cursor = await self.conn.execute(
+            "PRAGMA table_info(market_board_messages)"
+        )
+        columns = {row[1] for row in await cursor.fetchall()}
+        if not columns or "page_index" in columns:
+            return
+
+        await self.conn.execute(
+            "ALTER TABLE market_board_messages RENAME TO _market_board_old"
+        )
+        await self.conn.execute(
+            """
+            CREATE TABLE market_board_messages (
+                guild_id INTEGER NOT NULL,
+                page_index INTEGER NOT NULL,
+                message_id INTEGER NOT NULL,
+                PRIMARY KEY (guild_id, page_index)
+            )
+            """
+        )
+        await self.conn.execute(
+            """
+            INSERT INTO market_board_messages (guild_id, page_index, message_id)
+            SELECT guild_id, 0, message_id FROM _market_board_old
+            """
+        )
+        await self.conn.execute("DROP TABLE _market_board_old")
+
+    async def _backfill_market_open_snapshots(self) -> None:
+        """Insert missing open snapshots for markets created before price logging."""
+        cursor = await self.conn.execute(
+            """
+            SELECT b.id, b.created_at, b.liquidity_b
+            FROM bets b
+            WHERE b.bet_kind = ?
+            AND NOT EXISTS (
+                SELECT 1 FROM market_price_snapshots s
+                WHERE s.bet_id = b.id AND s.event = ?
+            )
+            """,
+            (BetKind.MARKET.value, MarketSnapshotEvent.OPEN.value),
+        )
+        rows = await cursor.fetchall()
+        for row in rows:
+            yes_price = lmsr_price_yes(0.0, 0.0, float(row["liquidity_b"]))
+            await self.conn.execute(
+                """
+                INSERT INTO market_price_snapshots (
+                    bet_id, recorded_at, q_yes, q_no, yes_price, event
+                ) VALUES (?, ?, 0, 0, ?, ?)
+                """,
+                (
+                    row["id"],
+                    row["created_at"],
+                    yes_price,
+                    MarketSnapshotEvent.OPEN.value,
+                ),
+            )
+        if rows:
+            logger.info("Backfilled open snapshots for %d market(s)", len(rows))
 
     async def close(self) -> None:
         if self._conn:
@@ -720,54 +798,176 @@ class Database:
         rows = await cursor.fetchall()
         return [_row_to_market_price_snapshot(row) for row in rows]
 
-    async def set_bet_board_message_id(
-        self, bet_id: int, message_id: int, *, commit: bool = True
+    async def set_market_board_message_ids(
+        self,
+        guild_id: int,
+        message_ids: list[int],
+        *,
+        commit: bool = True,
     ) -> None:
         await self.conn.execute(
-            "UPDATE bets SET board_message_id = ? WHERE id = ?",
-            (message_id, bet_id),
+            "DELETE FROM market_board_messages WHERE guild_id = ?",
+            (guild_id,),
+        )
+        for page_index, message_id in enumerate(message_ids):
+            await self.conn.execute(
+                """
+                INSERT INTO market_board_messages (guild_id, page_index, message_id)
+                VALUES (?, ?, ?)
+                """,
+                (guild_id, page_index, message_id),
+            )
+        await self._commit_if(commit)
+
+    async def get_market_board_message_ids(self, guild_id: int) -> list[int]:
+        cursor = await self.conn.execute(
+            """
+            SELECT message_id FROM market_board_messages
+            WHERE guild_id = ?
+            ORDER BY page_index ASC
+            """,
+            (guild_id,),
+        )
+        rows = await cursor.fetchall()
+        return [int(row["message_id"]) for row in rows]
+
+    async def set_market_board_message_id(
+        self, guild_id: int, message_id: int, *, commit: bool = True
+    ) -> None:
+        await self.set_market_board_message_ids(
+            guild_id, [message_id], commit=commit
+        )
+
+    async def get_market_board_message_id(self, guild_id: int) -> int | None:
+        ids = await self.get_market_board_message_ids(guild_id)
+        return ids[0] if ids else None
+
+    async def clear_market_board_message_ids(
+        self, guild_id: int, *, commit: bool = True
+    ) -> None:
+        await self.conn.execute(
+            "DELETE FROM market_board_messages WHERE guild_id = ?",
+            (guild_id,),
         )
         await self._commit_if(commit)
 
-    async def clear_bet_board_message_id(
-        self, bet_id: int, *, commit: bool = True
+    async def clear_market_board_message_id(
+        self, guild_id: int, *, commit: bool = True
+    ) -> None:
+        await self.clear_market_board_message_ids(guild_id, commit=commit)
+
+    async def set_market_board_list_message_id(
+        self, guild_id: int, message_id: int, *, commit: bool = True
     ) -> None:
         await self.conn.execute(
-            "UPDATE bets SET board_message_id = NULL WHERE id = ?",
-            (bet_id,),
+            """
+            INSERT INTO market_board_list_messages (guild_id, message_id)
+            VALUES (?, ?)
+            ON CONFLICT(guild_id) DO UPDATE SET message_id = excluded.message_id
+            """,
+            (guild_id, message_id),
         )
         await self._commit_if(commit)
 
-    async def get_active_markets_for_board(self) -> list[Bet]:
-        """Open or closed prediction markets that should appear on the board."""
+    async def get_market_board_list_message_id(self, guild_id: int) -> int | None:
+        cursor = await self.conn.execute(
+            """
+            SELECT message_id FROM market_board_list_messages
+            WHERE guild_id = ?
+            """,
+            (guild_id,),
+        )
+        row = await cursor.fetchone()
+        return int(row["message_id"]) if row else None
+
+    async def clear_market_board_list_message_id(
+        self, guild_id: int, *, commit: bool = True
+    ) -> None:
+        await self.conn.execute(
+            "DELETE FROM market_board_list_messages WHERE guild_id = ?",
+            (guild_id,),
+        )
+        await self._commit_if(commit)
+
+    async def get_markets_for_board(
+        self, guild_id: int, resolved_after: datetime
+    ) -> list[Bet]:
+        """Markets to show on the guild board (active + recently resolved)."""
         cursor = await self.conn.execute(
             """
             SELECT * FROM bets
-            WHERE bet_kind = ? AND status IN (?, ?)
+            WHERE guild_id = ? AND bet_kind = ?
+              AND (
+                status IN (?, ?)
+                OR (
+                  status IN (?, ?)
+                  AND resolved_at IS NOT NULL
+                  AND resolved_at > ?
+                )
+              )
             ORDER BY created_at ASC
             """,
-            (BetKind.MARKET.value, BetStatus.OPEN.value, BetStatus.CLOSED.value),
+            (
+                guild_id,
+                BetKind.MARKET.value,
+                BetStatus.OPEN.value,
+                BetStatus.CLOSED.value,
+                BetStatus.RESOLVED.value,
+                BetStatus.CANCELLED.value,
+                resolved_after.isoformat(),
+            ),
         )
         rows = await cursor.fetchall()
         return [_row_to_bet(row) for row in rows]
 
-    async def get_stale_board_markets(
-        self, purge_before: datetime
-    ) -> list[Bet]:
-        """Resolved/cancelled markets whose board posts should be deleted."""
+    async def get_guild_ids_needing_board_refresh(
+        self, resolved_before: datetime
+    ) -> list[int]:
+        """Guilds with resolved markets that just aged off the board retention."""
         cursor = await self.conn.execute(
             """
-            SELECT * FROM bets
+            SELECT DISTINCT guild_id FROM bets
             WHERE bet_kind = ?
-              AND board_message_id IS NOT NULL
+              AND status IN (?, ?)
               AND resolved_at IS NOT NULL
               AND resolved_at <= ?
-            ORDER BY resolved_at ASC
             """,
-            (BetKind.MARKET.value, purge_before.isoformat()),
+            (
+                BetKind.MARKET.value,
+                BetStatus.RESOLVED.value,
+                BetStatus.CANCELLED.value,
+                resolved_before.isoformat(),
+            ),
         )
-        rows = await cursor.fetchall()
-        return [_row_to_bet(row) for row in rows]
+        return [int(row["guild_id"]) for row in await cursor.fetchall()]
+
+    async def get_guild_ids_with_board_markets(
+        self, resolved_after: datetime
+    ) -> list[int]:
+        """Distinct guilds that currently have at least one board-visible market."""
+        cursor = await self.conn.execute(
+            """
+            SELECT DISTINCT guild_id FROM bets
+            WHERE bet_kind = ?
+              AND (
+                status IN (?, ?)
+                OR (
+                  status IN (?, ?)
+                  AND resolved_at IS NOT NULL
+                  AND resolved_at > ?
+                )
+              )
+            """,
+            (
+                BetKind.MARKET.value,
+                BetStatus.OPEN.value,
+                BetStatus.CLOSED.value,
+                BetStatus.RESOLVED.value,
+                BetStatus.CANCELLED.value,
+                resolved_after.isoformat(),
+            ),
+        )
+        return [int(row["guild_id"]) for row in await cursor.fetchall()]
 
     async def set_bet_message_id(self, bet_id: int, message_id: int) -> None:
         await self.conn.execute(

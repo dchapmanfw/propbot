@@ -28,7 +28,10 @@ async def db():
 
 
 @pytest.fixture
-def bot():
+def bot(monkeypatch):
+    import bot as bot_module
+
+    monkeypatch.setattr(bot_module, "MARKET_BOARD_CHANNEL_ID", None)
     return PropBetBot()
 
 
