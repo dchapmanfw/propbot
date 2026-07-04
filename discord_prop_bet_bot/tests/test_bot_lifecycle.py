@@ -38,6 +38,18 @@ def test_prop_bet_bot_init_invalid_refund_duration():
             PropBetBot()
 
 
+def test_prop_bet_bot_init_invalid_market_board_retention():
+    def fake_parse(value: str):
+        if value == "24h":
+            return timedelta(hours=24)
+        raise DurationParseError("bad")
+
+    with patch("bot.MARKET_BOARD_RETENTION", "bad"):
+        with patch("bot.parse_duration", side_effect=fake_parse):
+            with pytest.raises(SystemExit, match="MARKET_BOARD_RETENTION"):
+                PropBetBot()
+
+
 def test_prop_bet_bot_init_success(bot):
     assert bot._unresolved_refund_after.total_seconds() > 0
 

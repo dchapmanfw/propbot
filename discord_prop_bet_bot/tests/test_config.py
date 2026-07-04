@@ -20,3 +20,27 @@ def test_invalid_allowed_channel_id_exits():
     )
     assert result.returncode != 0
     assert "ALLOWED_CHANNEL_ID" in result.stderr
+
+
+def test_invalid_market_board_channel_id_exits():
+    result = subprocess.run(
+        [sys.executable, "-c", "import config"],
+        cwd=PROJECT_ROOT,
+        env={**os.environ, "MARKET_BOARD_CHANNEL_ID": "not-a-number"},
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode != 0
+    assert "MARKET_BOARD_CHANNEL_ID" in result.stderr
+
+
+def test_invalid_dev_guild_id_exits():
+    result = subprocess.run(
+        [sys.executable, "-c", "import config"],
+        cwd=PROJECT_ROOT,
+        env={**os.environ, "DEV_GUILD_ID": "not-a-number"},
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode != 0
+    assert "DEV_GUILD_ID" in result.stderr

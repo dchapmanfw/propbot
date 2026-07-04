@@ -657,6 +657,37 @@ async def test_market_sell_and_status(cog, db, bot_mock):
 
 
 @pytest.mark.asyncio
+async def test_market_analysis_paths(cog, db):
+    interaction = make_interaction(guild=False)
+    await call_slash(cog, cog.market_analysis, interaction, 1)
+    interaction.response.send_message.assert_awaited_once()
+
+    bet_id = await _open_market(db)
+    interaction = make_interaction()
+    await call_slash(cog, cog.market_analysis, interaction, bet_id)
+    interaction.response.defer.assert_awaited_once_with(ephemeral=True)
+    interaction.followup.send.assert_awaited_once()
+    embed = interaction.followup.send.await_args.kwargs["embed"]
+    assert embed.title == f"Market #{bet_id}"
+    assert "first trade" in next(
+        field.value for field in embed.fields if field.name == "Trend"
+    )
+
+    prop_id = await _open_bet(db)
+    interaction = make_interaction()
+    await call_slash(cog, cog.market_analysis, interaction, prop_id)
+    assert "prop bet" in interaction.followup.send.await_args.args[0].lower()
+
+    await db.ensure_user(1, BETTOR_ID)
+    await MarketService(db).buy_shares(1, bet_id, BETTOR_ID, WagerPick.YES, 50)
+    interaction = make_interaction()
+    await call_slash(cog, cog.market_analysis, interaction, bet_id)
+    embed = interaction.followup.send.await_args.kwargs["embed"]
+    trend_field = next(field for field in embed.fields if field.name == "Trend")
+    assert "`" in trend_field.value
+
+
+@pytest.mark.asyncio
 async def test_market_resolve_and_cancel_paths(cog, db, bot_mock):
     bet_id = await _open_market(db)
     interaction = make_interaction(user_id=BETTOR_ID)

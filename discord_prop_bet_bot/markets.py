@@ -17,7 +17,15 @@ from lmsr import (
     lmsr_sell_proceeds,
     shares_for_budget,
 )
-from models import Bet, BetKind, BetOutcome, BetStatus, MarketPosition, WagerPick
+from models import (
+    Bet,
+    BetKind,
+    BetOutcome,
+    BetStatus,
+    MarketPosition,
+    MarketSnapshotEvent,
+    WagerPick,
+)
 
 
 def _payout_shares(shares: float) -> int:
@@ -278,7 +286,7 @@ class MarketService:
         if b <= 0:
             raise ValueError("Market liquidity is misconfigured.")
         subsidy = lmsr_initial_subsidy(b)
-        return await self.db.create_market(
+        bet = await self.db.create_market(
             guild_id,
             channel_id,
             creator_id,
@@ -287,6 +295,15 @@ class MarketService:
             b,
             subsidy,
         )
+        await self.db.log_market_snapshot(
+            bet.id,
+            bet.q_yes,
+            bet.q_no,
+            bet.liquidity_b,
+            MarketSnapshotEvent.OPEN,
+            recorded_at=bet.created_at,
+        )
+        return bet
 
     async def buy_shares(
         self,
@@ -333,6 +350,14 @@ class MarketService:
             )
             position = await self.db.upsert_market_position(
                 bet_id, user_id, side, new_shares, commit=False
+            )
+            await self.db.log_market_snapshot(
+                bet_id,
+                new_q_yes,
+                new_q_no,
+                bet.liquidity_b,
+                MarketSnapshotEvent.BUY,
+                commit=False,
             )
 
         return position, new_balance, shares
@@ -387,6 +412,14 @@ class MarketService:
                 await self.db.upsert_market_position(
                     bet_id, user_id, side, remaining, commit=False
                 )
+            await self.db.log_market_snapshot(
+                bet_id,
+                new_q_yes,
+                new_q_no,
+                bet.liquidity_b,
+                MarketSnapshotEvent.SELL,
+                commit=False,
+            )
 
         return new_balance, shares
 

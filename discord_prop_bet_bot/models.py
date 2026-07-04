@@ -62,6 +62,14 @@ class Bet:
     q_yes: float = 0.0
     q_no: float = 0.0
     liquidity_b: float = 100.0
+    board_message_id: int | None = None
+    resolved_at: datetime | None = None
+
+
+class MarketSnapshotEvent(str, Enum):
+    OPEN = "open"
+    BUY = "buy"
+    SELL = "sell"
 
 
 @dataclass
@@ -71,6 +79,17 @@ class MarketPosition:
     user_id: int
     side: WagerPick
     shares: float
+
+
+@dataclass
+class MarketPriceSnapshot:
+    id: int
+    bet_id: int
+    recorded_at: datetime
+    q_yes: float
+    q_no: float
+    yes_price: float
+    event: MarketSnapshotEvent
 
 
 @dataclass

@@ -13,11 +13,14 @@ from config import (
     BET_EXPIRY_CHECK_INTERVAL,
     DEV_GUILD_ID,
     DISCORD_TOKEN,
+    MARKET_BOARD_CHANNEL_ID,
+    MARKET_BOARD_RETENTION,
     NO_EMOJI,
     UNRESOLVED_REFUND_AFTER,
     YES_EMOJI,
 )
 from database import Database
+from market_charts import build_market_analysis_embed
 from markets import MarketService, build_market_embed
 from models import Bet, BetKind, BetStatus
 from process_guard import kill_other_bot_instances
@@ -48,6 +51,12 @@ class PropBetBot(commands.Bot):
             raise SystemExit(
                 f"Invalid UNRESOLVED_REFUND_AFTER ({UNRESOLVED_REFUND_AFTER!r}): {exc}"
             ) from exc
+        try:
+            self._market_board_retention = parse_duration(MARKET_BOARD_RETENTION)
+        except DurationParseError as exc:
+            raise SystemExit(
+                f"Invalid MARKET_BOARD_RETENTION ({MARKET_BOARD_RETENTION!r}): {exc}"
+            ) from exc
 
     async def setup_hook(self) -> None:
         await self.db.connect()
@@ -64,6 +73,10 @@ class PropBetBot(commands.Bot):
 
         if not self.check_expired_bets.is_running():
             self.check_expired_bets.start()
+
+        if MARKET_BOARD_CHANNEL_ID is not None:
+            for bet in await self.db.get_active_markets_for_board():
+                await self.refresh_market_board_message(bet.id)
 
     async def _restore_open_bet_reactions(self, open_bets: list[Bet]) -> None:
         """Re-add YES/NO reactions on open bet messages (e.g. after thread creation)."""
@@ -179,6 +192,72 @@ class PropBetBot(commands.Bot):
         if bet.status == BetStatus.OPEN:
             await ensure_yes_no_reactions(message)
 
+        if bet.bet_kind == BetKind.MARKET:
+            await self.refresh_market_board_message(bet_id)
+
+    async def refresh_market_board_message(self, bet_id: int) -> None:
+        """Post or update the live analysis embed in the market board channel."""
+        if MARKET_BOARD_CHANNEL_ID is None:
+            return
+
+        bet = await self.db.get_bet(bet_id)
+        if not bet or bet.bet_kind != BetKind.MARKET:
+            return
+
+        channel = await self.fetch_channel(MARKET_BOARD_CHANNEL_ID)
+        if not channel:
+            return
+
+        snapshots = await self.db.get_market_snapshots(bet_id)
+        embed = build_market_analysis_embed(
+            bet, snapshots, guild_id=bet.guild_id
+        )
+
+        if bet.board_message_id:
+            try:
+                message = await channel.fetch_message(bet.board_message_id)
+            except discord.NotFound:
+                await self.db.clear_bet_board_message_id(bet.id)
+            else:
+                await message.edit(embed=embed)
+                return
+
+        if bet.status not in (BetStatus.OPEN, BetStatus.CLOSED):
+            return
+
+        message = await channel.send(embed=embed)
+        await self.db.set_bet_board_message_id(bet.id, message.id)
+
+    async def _purge_stale_market_board_messages(self) -> None:
+        if MARKET_BOARD_CHANNEL_ID is None:
+            return
+
+        from datetime import datetime, timezone
+
+        purge_before = datetime.now(timezone.utc) - self._market_board_retention
+        channel = await self.fetch_channel(MARKET_BOARD_CHANNEL_ID)
+        if not channel:
+            return
+
+        for bet in await self.db.get_stale_board_markets(purge_before):
+            if bet.board_message_id:
+                try:
+                    message = await channel.fetch_message(bet.board_message_id)
+                except discord.NotFound:
+                    pass
+                else:
+                    try:
+                        await message.delete()
+                    except discord.HTTPException as exc:
+                        logger.warning(
+                            "Could not delete board message for market #%s: %s",
+                            bet.id,
+                            exc,
+                        )
+                        continue
+            await self.db.clear_bet_board_message_id(bet.id)
+            logger.info("Removed stale market board post for market #%d", bet.id)
+
     @tasks.loop(seconds=BET_EXPIRY_CHECK_INTERVAL)
     async def check_expired_bets(self) -> None:
         """Close expired open bets and refund stale unresolved closed bets."""
@@ -213,6 +292,8 @@ class PropBetBot(commands.Bot):
                     footer_extra="Auto-refunded — never resolved",
                 )
                 self.untrack_bet(bet.id)
+
+        await self._purge_stale_market_board_messages()
 
     @check_expired_bets.before_loop
     async def before_check_expired_bets(self) -> None:

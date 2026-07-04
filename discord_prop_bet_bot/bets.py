@@ -411,7 +411,8 @@ def build_help_embed() -> discord.Embed:
             "`/balance` — your coin balance\n"
             "`/bet_create` — open a prop bet (you are the bookie)\n"
             "`/market_create` — open a Polymarket-style prediction market\n"
-            "`/bet_status` / `/market_status` — details and participants\n"
+            "`/market_status` — details and participants\n"
+            "`/market_analysis` — YES price trend and live stats\n"
             "`/market_list` — all outstanding prediction markets\n"
             "`/bet_resolve` / `/market_resolve` — settle (creator or admin)\n"
             "`/bet_cancel` / `/market_cancel` — cancel and refund\n"
@@ -434,6 +435,8 @@ def build_help_embed() -> discord.Embed:
             "for YES/NO buttons in your DMs.\n"
             f"Max **{MAX_MARKET_TRADE_COINS}** coins per buy. Each winning share pays **1 coin** "
             "at resolution. Sell early with `/market_sell`.\n"
+            "Use `/market_analysis` to inspect how YES price moved over time.\n"
+            "Set `MARKET_BOARD_CHANNEL_ID` for a live-updating board channel.\n"
             "No bookie needed — the market uses automated LMSR pricing."
         ),
         inline=False,

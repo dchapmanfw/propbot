@@ -49,6 +49,22 @@ if _allowed_channel_raw:
 else:
     ALLOWED_CHANNEL_ID = None
 
+# Optional: channel for live market-analysis embeds (right-click channel → Copy Channel ID).
+_market_board_raw = os.getenv("MARKET_BOARD_CHANNEL_ID", "").strip()
+if _market_board_raw:
+    try:
+        MARKET_BOARD_CHANNEL_ID: int | None = int(_market_board_raw)
+    except ValueError as exc:
+        raise SystemExit(
+            "MARKET_BOARD_CHANNEL_ID must be a numeric Discord channel ID, "
+            f"got {_market_board_raw!r}"
+        ) from exc
+else:
+    MARKET_BOARD_CHANNEL_ID = None
+
+# How long resolved/cancelled board posts remain before deletion (e.g. 24h).
+MARKET_BOARD_RETENTION: str = os.getenv("MARKET_BOARD_RETENTION", "24h")
+
 # Emoji used for YES / NO reactions on bet messages.
 YES_EMOJI = "✅"
 NO_EMOJI = "❌"

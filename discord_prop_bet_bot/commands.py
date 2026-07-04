@@ -29,6 +29,7 @@ from config import ALLOWED_CHANNEL_ID, MAX_MARKET_TRADE_COINS, NO_EMOJI, YES_EMO
 from database import Database
 from economy import EconomyService, REDEMPTION_COST
 from lmsr import format_price_cents, lmsr_price_no, lmsr_price_yes
+from market_charts import build_market_analysis_embed
 from markets import (
     MarketService,
     build_market_embed,
@@ -856,6 +857,7 @@ class PropBetCommands(commands.Cog):
         bet = await self.db.get_bet(bet.id)
         assert bet is not None
         self.bot.track_open_bet(bet)
+        await self.bot.refresh_market_board_message(bet.id)
 
     @app_commands.command(
         name="market_sell",
@@ -1118,6 +1120,7 @@ class PropBetCommands(commands.Cog):
         if message:
             await message.edit(embed=embed)
 
+        await self.bot.refresh_market_board_message(bet_id)
         self.bot.untrack_bet(bet_id)
 
     @app_commands.command(
@@ -1169,6 +1172,40 @@ class PropBetCommands(commands.Cog):
         positions = await self.db.get_market_positions_for_bet(bet_id)
         creator = interaction.guild.get_member(bet.creator_id)
         embed = build_market_embed(bet, creator=creator, positions=positions)
+        await interaction.followup.send(embed=embed)
+
+    @app_commands.command(
+        name="market_analysis",
+        description="Show YES price trend and stats for a prediction market",
+    )
+    @app_commands.describe(bet_id="The market ID to analyze")
+    async def market_analysis(
+        self, interaction: discord.Interaction, bet_id: int
+    ) -> None:
+        if not interaction.guild:
+            await interaction.response.send_message(
+                "This command can only be used in a server.", ephemeral=True
+            )
+            return
+        if not await self._defer(interaction, ephemeral=True):
+            return
+        if not await self._require_allowed_channel(interaction, use_followup=True):
+            return
+
+        bet = await self.db.get_bet(bet_id)
+        if not bet or bet.guild_id != interaction.guild.id:
+            await interaction.followup.send("Market not found.")
+            return
+        if bet.bet_kind != BetKind.MARKET:
+            await interaction.followup.send(
+                "That ID is a prop bet — market analysis only applies to prediction markets."
+            )
+            return
+
+        snapshots = await self.db.get_market_snapshots(bet_id)
+        embed = build_market_analysis_embed(
+            bet, snapshots, guild_id=interaction.guild.id
+        )
         await interaction.followup.send(embed=embed)
 
     @app_commands.command(name="bet_resolve", description="Resolve a bet with an outcome")
@@ -1499,6 +1536,7 @@ class PropBetCommands(commands.Cog):
         if message:
             await message.edit(embed=embed)
 
+        await self.bot.refresh_market_board_message(bet_id)
         self.bot.untrack_bet(bet_id)
 
     @commands.Cog.listener()

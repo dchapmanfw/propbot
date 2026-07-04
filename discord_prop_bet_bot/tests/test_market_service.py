@@ -14,7 +14,7 @@ from markets import (
     portfolio_value_for_bet,
     portfolio_values_by_user,
 )
-from models import BetKind, BetOutcome, BetStatus, WagerPick
+from models import BetKind, BetOutcome, BetStatus, MarketSnapshotEvent, WagerPick
 
 
 @pytest.fixture
@@ -38,6 +38,30 @@ async def test_create_market_seeds_escrow(db, market):
     assert lmsr_price_yes(market.q_yes, market.q_no, market.liquidity_b) == pytest.approx(
         0.5
     )
+    snapshots = await db.get_market_snapshots(market.id)
+    assert len(snapshots) == 1
+    assert snapshots[0].event.value == "open"
+    assert snapshots[0].yes_price == pytest.approx(0.5)
+
+
+async def test_buy_and_sell_log_price_snapshots(db, market):
+    service = MarketService(db)
+    await db.ensure_user(1, 200)
+
+    await service.buy_shares(1, market.id, 200, WagerPick.YES, 50)
+    position = await db.get_market_position(market.id, 200, WagerPick.YES)
+    assert position is not None
+    await service.sell_shares(
+        1, market.id, 200, WagerPick.YES, position.shares / 2
+    )
+
+    snapshots = await db.get_market_snapshots(market.id)
+    assert len(snapshots) == 3
+    assert [snap.event for snap in snapshots] == [
+        MarketSnapshotEvent.OPEN,
+        MarketSnapshotEvent.BUY,
+        MarketSnapshotEvent.SELL,
+    ]
 
 
 async def test_buy_shares_updates_price_and_position(db, market):

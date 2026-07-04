@@ -50,6 +50,7 @@ def bot_mock(db):
     bot.fetch_user = AsyncMock(return_value=MagicMock())
     bot.fetch_channel = AsyncMock()
     bot.refresh_bet_message = AsyncMock()
+    bot.refresh_market_board_message = AsyncMock()
     bot.track_open_bet = MagicMock()
     bot.untrack_bet = MagicMock()
     bot._wager_prompt_at = {}

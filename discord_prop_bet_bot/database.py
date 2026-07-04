@@ -11,12 +11,15 @@ from typing import Any, AsyncIterator
 import aiosqlite
 
 from config import DATABASE_PATH, STARTING_BALANCE
+from lmsr import lmsr_price_yes
 from models import (
     Bet,
     BetKind,
     BetOutcome,
     BetStatus,
     MarketPosition,
+    MarketPriceSnapshot,
+    MarketSnapshotEvent,
     UserBalance,
     Wager,
     WagerPick,
@@ -103,6 +106,16 @@ def _row_to_bet(row: aiosqlite.Row) -> Bet:
         q_yes=float(row["q_yes"]) if "q_yes" in keys else 0.0,
         q_no=float(row["q_no"]) if "q_no" in keys else 0.0,
         liquidity_b=float(row["liquidity_b"]) if "liquidity_b" in keys else 100.0,
+        board_message_id=(
+            int(row["board_message_id"]) if row["board_message_id"] is not None else None
+        )
+        if "board_message_id" in keys
+        else None,
+        resolved_at=(
+            _parse_dt(row["resolved_at"]) if row["resolved_at"] is not None else None
+        )
+        if "resolved_at" in keys
+        else None,
     )
 
 
@@ -134,6 +147,18 @@ def _row_to_market_position(row: aiosqlite.Row) -> MarketPosition:
         user_id=row["user_id"],
         side=WagerPick(row["side"]),
         shares=float(row["shares"]),
+    )
+
+
+def _row_to_market_price_snapshot(row: aiosqlite.Row) -> MarketPriceSnapshot:
+    return MarketPriceSnapshot(
+        id=row["id"],
+        bet_id=row["bet_id"],
+        recorded_at=_parse_dt(row["recorded_at"]),
+        q_yes=float(row["q_yes"]),
+        q_no=float(row["q_no"]),
+        yes_price=float(row["yes_price"]),
+        event=MarketSnapshotEvent(row["event"]),
     )
 
 
@@ -210,6 +235,36 @@ class Database:
             ON market_positions(bet_id)
             """
         )
+
+        await self.conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS market_price_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                bet_id INTEGER NOT NULL,
+                recorded_at TEXT NOT NULL,
+                q_yes REAL NOT NULL,
+                q_no REAL NOT NULL,
+                yes_price REAL NOT NULL,
+                event TEXT NOT NULL,
+                FOREIGN KEY (bet_id) REFERENCES bets(id) ON DELETE CASCADE
+            )
+            """
+        )
+        await self.conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_market_snapshots_bet
+            ON market_price_snapshots(bet_id, recorded_at)
+            """
+        )
+
+        if "board_message_id" not in columns:
+            await self.conn.execute(
+                "ALTER TABLE bets ADD COLUMN board_message_id INTEGER"
+            )
+        if "resolved_at" not in columns:
+            await self.conn.execute(
+                "ALTER TABLE bets ADD COLUMN resolved_at TEXT"
+            )
 
     async def close(self) -> None:
         if self._conn:
@@ -622,6 +677,98 @@ class Database:
         )
         await self._commit_if(commit)
 
+    async def log_market_snapshot(
+        self,
+        bet_id: int,
+        q_yes: float,
+        q_no: float,
+        liquidity_b: float,
+        event: MarketSnapshotEvent,
+        *,
+        recorded_at: datetime | None = None,
+        commit: bool = True,
+    ) -> None:
+        """Record LMSR state after a market opens or trades."""
+        recorded_at = recorded_at or datetime.now(timezone.utc)
+        yes_price = lmsr_price_yes(q_yes, q_no, liquidity_b)
+        await self.conn.execute(
+            """
+            INSERT INTO market_price_snapshots (
+                bet_id, recorded_at, q_yes, q_no, yes_price, event
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                bet_id,
+                recorded_at.isoformat(),
+                q_yes,
+                q_no,
+                yes_price,
+                event.value,
+            ),
+        )
+        await self._commit_if(commit)
+
+    async def get_market_snapshots(self, bet_id: int) -> list[MarketPriceSnapshot]:
+        cursor = await self.conn.execute(
+            """
+            SELECT * FROM market_price_snapshots
+            WHERE bet_id = ?
+            ORDER BY recorded_at ASC, id ASC
+            """,
+            (bet_id,),
+        )
+        rows = await cursor.fetchall()
+        return [_row_to_market_price_snapshot(row) for row in rows]
+
+    async def set_bet_board_message_id(
+        self, bet_id: int, message_id: int, *, commit: bool = True
+    ) -> None:
+        await self.conn.execute(
+            "UPDATE bets SET board_message_id = ? WHERE id = ?",
+            (message_id, bet_id),
+        )
+        await self._commit_if(commit)
+
+    async def clear_bet_board_message_id(
+        self, bet_id: int, *, commit: bool = True
+    ) -> None:
+        await self.conn.execute(
+            "UPDATE bets SET board_message_id = NULL WHERE id = ?",
+            (bet_id,),
+        )
+        await self._commit_if(commit)
+
+    async def get_active_markets_for_board(self) -> list[Bet]:
+        """Open or closed prediction markets that should appear on the board."""
+        cursor = await self.conn.execute(
+            """
+            SELECT * FROM bets
+            WHERE bet_kind = ? AND status IN (?, ?)
+            ORDER BY created_at ASC
+            """,
+            (BetKind.MARKET.value, BetStatus.OPEN.value, BetStatus.CLOSED.value),
+        )
+        rows = await cursor.fetchall()
+        return [_row_to_bet(row) for row in rows]
+
+    async def get_stale_board_markets(
+        self, purge_before: datetime
+    ) -> list[Bet]:
+        """Resolved/cancelled markets whose board posts should be deleted."""
+        cursor = await self.conn.execute(
+            """
+            SELECT * FROM bets
+            WHERE bet_kind = ?
+              AND board_message_id IS NOT NULL
+              AND resolved_at IS NOT NULL
+              AND resolved_at <= ?
+            ORDER BY resolved_at ASC
+            """,
+            (BetKind.MARKET.value, purge_before.isoformat()),
+        )
+        rows = await cursor.fetchall()
+        return [_row_to_bet(row) for row in rows]
+
     async def set_bet_message_id(self, bet_id: int, message_id: int) -> None:
         await self.conn.execute(
             "UPDATE bets SET message_id = ? WHERE id = ?",
@@ -671,15 +818,17 @@ class Database:
         commit: bool = True,
     ) -> Bet | None:
         """Atomically mark a closed bet resolved; returns None if not claimable."""
+        now = datetime.now(timezone.utc)
         cursor = await self.conn.execute(
             """
             UPDATE bets
-            SET status = ?, outcome = ?
+            SET status = ?, outcome = ?, resolved_at = ?
             WHERE id = ? AND status = ?
             """,
             (
                 BetStatus.RESOLVED.value,
                 outcome.value,
+                now.isoformat(),
                 bet_id,
                 BetStatus.CLOSED.value,
             ),
@@ -700,15 +849,17 @@ class Database:
         commit: bool = True,
     ) -> Bet | None:
         """Atomically mark a bet cancelled; returns None if not claimable."""
+        now = datetime.now(timezone.utc)
         placeholders = ",".join("?" * len(from_statuses))
         cursor = await self.conn.execute(
             f"""
             UPDATE bets
-            SET status = ?, outcome = NULL
+            SET status = ?, outcome = NULL, resolved_at = ?
             WHERE id = ? AND status IN ({placeholders})
             """,
             (
                 BetStatus.CANCELLED.value,
+                now.isoformat(),
                 bet_id,
                 *[status.value for status in from_statuses],
             ),
