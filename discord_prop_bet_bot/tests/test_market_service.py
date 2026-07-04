@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -114,7 +115,9 @@ async def test_buy_shares_rejects_over_trade_cap(db, market):
         await service.buy_shares(1, market.id, 200, WagerPick.YES, 51)
 
 
-async def test_portfolio_value_for_bet_matches_sequential_sell(db, market):
+async def test_portfolio_value_for_bet_uses_marginal_price(db, market):
+    from lmsr import lmsr_price_yes
+
     service = MarketService(db)
     await db.ensure_user(1, 200)
     _, _, shares = await service.buy_shares(1, market.id, 200, WagerPick.YES, 50)
@@ -127,8 +130,23 @@ async def test_portfolio_value_for_bet_matches_sequential_sell(db, market):
         updated.liquidity_b,
         [(WagerPick.YES, shares)],
     )
+    expected = int(
+        shares * lmsr_price_yes(updated.q_yes, updated.q_no, updated.liquidity_b)
+    )
+    assert value == expected
     assert value > 0
-    assert value <= 50
+
+
+def test_portfolio_value_ignores_sell_slippage_for_large_positions():
+    from lmsr import lmsr_price_no, lmsr_sell_proceeds
+
+    q_yes, q_no, b = 1198.65, 1270.66, 100.0
+    shares = 1114.69
+    sell_value = int(math.floor(lmsr_sell_proceeds(q_yes, q_no, WagerPick.NO, shares, b)))
+    portfolio = portfolio_value_for_bet(q_yes, q_no, b, [(WagerPick.NO, shares)])
+
+    assert portfolio > sell_value
+    assert portfolio == int(math.floor(shares * lmsr_price_no(q_yes, q_no, b)))
 
 
 def test_portfolio_values_by_user_aggregates_per_market():

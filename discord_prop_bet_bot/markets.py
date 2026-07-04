@@ -198,18 +198,17 @@ def portfolio_value_for_bet(
     liquidity_b: float,
     positions: list[tuple[WagerPick, float]],
 ) -> int:
-    """Mark-to-market coin value if all `positions` were sold at current LMSR prices."""
-    total = 0
+    """Mark-to-market coin value of `positions` at current displayed LMSR prices."""
+    total = 0.0
     for side, shares in positions:
         if shares <= 1e-9:
             continue
-        raw = lmsr_sell_proceeds(q_yes, q_no, side, shares, liquidity_b)
-        total += int(math.floor(raw))
         if side == WagerPick.YES:
-            q_yes -= shares
+            price = lmsr_price_yes(q_yes, q_no, liquidity_b)
         else:
-            q_no -= shares
-    return total
+            price = lmsr_price_no(q_yes, q_no, liquidity_b)
+        total += shares * price
+    return int(math.floor(total))
 
 
 def portfolio_values_by_user(
