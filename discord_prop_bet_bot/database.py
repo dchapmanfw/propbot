@@ -900,7 +900,7 @@ class Database:
               AND (
                 status IN (?, ?)
                 OR (
-                  status IN (?, ?)
+                  status = ?
                   AND resolved_at IS NOT NULL
                   AND resolved_at > ?
                 )
@@ -913,7 +913,6 @@ class Database:
                 BetStatus.OPEN.value,
                 BetStatus.CLOSED.value,
                 BetStatus.RESOLVED.value,
-                BetStatus.CANCELLED.value,
                 resolved_after.isoformat(),
             ),
         )
@@ -928,14 +927,13 @@ class Database:
             """
             SELECT DISTINCT guild_id FROM bets
             WHERE bet_kind = ?
-              AND status IN (?, ?)
+              AND status = ?
               AND resolved_at IS NOT NULL
               AND resolved_at <= ?
             """,
             (
                 BetKind.MARKET.value,
                 BetStatus.RESOLVED.value,
-                BetStatus.CANCELLED.value,
                 resolved_before.isoformat(),
             ),
         )
@@ -952,7 +950,7 @@ class Database:
               AND (
                 status IN (?, ?)
                 OR (
-                  status IN (?, ?)
+                  status = ?
                   AND resolved_at IS NOT NULL
                   AND resolved_at > ?
                 )
@@ -963,7 +961,6 @@ class Database:
                 BetStatus.OPEN.value,
                 BetStatus.CLOSED.value,
                 BetStatus.RESOLVED.value,
-                BetStatus.CANCELLED.value,
                 resolved_after.isoformat(),
             ),
         )
