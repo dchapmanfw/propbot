@@ -233,6 +233,68 @@ class MarketBetPickView(discord.ui.View):
         )
 
 
+class MarketResolveConfirmView(discord.ui.View):
+    """Prompt to close an open market early and resolve with a chosen outcome."""
+
+    def __init__(
+        self,
+        cog: PropBetCommands,
+        bet_id: int,
+        outcome: BetOutcome,
+        owner_id: int,
+    ) -> None:
+        super().__init__(timeout=120)
+        self.cog = cog
+        self.bet_id = bet_id
+        self.outcome = outcome
+        self.owner_id = owner_id
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message(
+                "Only the person who ran `/market_resolve` can confirm.",
+                ephemeral=True,
+            )
+            return False
+        return True
+
+    @discord.ui.button(label="Close & resolve", style=discord.ButtonStyle.danger)
+    async def close_and_resolve(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        for child in self.children:
+            child.disabled = True
+        await interaction.response.edit_message(
+            content="Closing market and resolving…", view=self
+        )
+
+        bet = await self.cog.db.get_bet(self.bet_id)
+        if not bet or bet.status not in (BetStatus.OPEN, BetStatus.CLOSED):
+            await interaction.followup.send(
+                "Market is no longer open for resolution.", ephemeral=True
+            )
+            return
+
+        if bet.status == BetStatus.OPEN:
+            closed = await MarketService(self.cog.db).close_market(self.bet_id)
+            if closed:
+                await self.cog.bot.refresh_bet_message(self.bet_id)
+
+        await self.cog._finish_market_resolve(
+            interaction, self.bet_id, self.outcome
+        )
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        for child in self.children:
+            child.disabled = True
+        await interaction.response.edit_message(
+            content="Resolution cancelled.", view=self
+        )
+
+
 class WagerButtonView(discord.ui.View):
     """Button that opens the wager modal (used after reaction or in DMs)."""
 
@@ -979,51 +1041,24 @@ class PropBetCommands(commands.Cog):
                 bet = await self.db.get_bet(bet_id)
                 assert bet is not None
             else:
+                closes = discord.utils.format_dt(bet.close_time, style="R")
+                view = MarketResolveConfirmView(
+                    self,
+                    bet_id,
+                    BetOutcome(outcome.value),
+                    owner_id=interaction.user.id,
+                )
                 await interaction.followup.send(
-                    "This market is still open. Wait until trading closes, then resolve.",
+                    f"Market #{bet_id} is still open (closes {closes}). "
+                    f"Close trading now and resolve as **{outcome.name}**?",
+                    view=view,
                     ephemeral=True,
                 )
                 return
 
-        service = MarketService(self.db)
-        try:
-            resolved, payouts = await service.resolve_market(
-                bet_id, BetOutcome(outcome.value)
-            )
-        except ValueError as exc:
-            await interaction.followup.send(str(exc), ephemeral=True)
-            return
-
-        positions = await self.db.get_market_positions_for_bet(bet_id)
-        creator = interaction.guild.get_member(bet.creator_id)
-        embed = build_market_embed(
-            resolved,
-            creator=creator,
-            positions=positions,
-            footer_extra="Trading closed",
+        await self._finish_market_resolve(
+            interaction, bet_id, BetOutcome(outcome.value)
         )
-
-        if outcome.value == "refund":
-            result_text = "All positions liquidated at current prices."
-        else:
-            lines = []
-            for user_id, payout, pick in payouts:
-                lines.append(
-                    f"<@{user_id}> won **{payout}** coins "
-                    f"({emoji_from_pick(pick)} shares)"
-                )
-            result_text = "\n".join(lines) if lines else "_No winning shares._"
-
-        await interaction.followup.send(
-            content=f"Market #{bet_id} resolved.\n{result_text}",
-            embed=embed,
-        )
-
-        message = await self._get_bet_message(resolved)
-        if message:
-            await message.edit(embed=embed)
-
-        self.bot.untrack_bet(bet_id)
 
     @app_commands.command(
         name="market_cancel",
@@ -1416,6 +1451,55 @@ class PropBetCommands(commands.Cog):
             return await channel.fetch_message(bet.message_id)
         except discord.NotFound:
             return None
+
+    async def _finish_market_resolve(
+        self,
+        interaction: discord.Interaction,
+        bet_id: int,
+        outcome: BetOutcome,
+    ) -> None:
+        """Resolve a closed market, announce payouts, and update the public embed."""
+        service = MarketService(self.db)
+        try:
+            resolved, payouts = await service.resolve_market(bet_id, outcome)
+        except ValueError as exc:
+            await interaction.followup.send(str(exc), ephemeral=True)
+            return
+
+        positions = await self.db.get_market_positions_for_bet(bet_id)
+        creator = (
+            interaction.guild.get_member(resolved.creator_id)
+            if interaction.guild
+            else None
+        )
+        embed = build_market_embed(
+            resolved,
+            creator=creator,
+            positions=positions,
+            footer_extra="Trading closed",
+        )
+
+        if outcome == BetOutcome.REFUND:
+            result_text = "All positions liquidated at current prices."
+        else:
+            lines = []
+            for user_id, payout, pick in payouts:
+                lines.append(
+                    f"<@{user_id}> won **{payout}** coins "
+                    f"({emoji_from_pick(pick)} shares)"
+                )
+            result_text = "\n".join(lines) if lines else "_No winning shares._"
+
+        await interaction.followup.send(
+            content=f"Market #{bet_id} resolved.\n{result_text}",
+            embed=embed,
+        )
+
+        message = await self._get_bet_message(resolved)
+        if message:
+            await message.edit(embed=embed)
+
+        self.bot.untrack_bet(bet_id)
 
     @commands.Cog.listener()
     async def on_thread_create(self, thread: discord.Thread) -> None:

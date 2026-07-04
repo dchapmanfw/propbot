@@ -16,6 +16,7 @@ from commands import (
     MarketBetPickView,
     MarketBuyButtonView,
     MarketBuyModal,
+    MarketResolveConfirmView,
     PropBetCommands,
     WagerButtonView,
     WagerModal,
@@ -667,6 +668,18 @@ async def test_market_resolve_and_cancel_paths(cog, db, bot_mock):
         app_commands.Choice(name="YES", value="yes"),
     )
     interaction.followup.send.assert_awaited_once()
+    assert "Only the market creator" in interaction.followup.send.await_args.args[0]
+
+    interaction = make_interaction(user_id=BOOKIE_ID)
+    await call_slash(
+        cog,
+        cog.market_resolve,
+        interaction,
+        bet_id,
+        app_commands.Choice(name="YES", value="yes"),
+    )
+    view = interaction.followup.send.await_args.kwargs["view"]
+    assert isinstance(view, MarketResolveConfirmView)
 
     await db.update_bet_status(bet_id, BetStatus.CLOSED)
     interaction = make_interaction(user_id=BOOKIE_ID)
@@ -684,6 +697,42 @@ async def test_market_resolve_and_cancel_paths(cog, db, bot_mock):
     interaction = make_interaction(user_id=BOOKIE_ID)
     await call_slash(cog, cog.market_cancel, interaction, bet_id)
     interaction.followup.send.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_market_resolve_confirm_closes_and_resolves(cog, db, bot_mock):
+    bet_id = await _open_market(db)
+    await db.ensure_user(1, BOOKIE_ID)
+    await db.ensure_user(1, BETTOR_ID)
+    await MarketService(db).buy_shares(1, bet_id, BETTOR_ID, WagerPick.YES, 50)
+
+    interaction = make_interaction(user_id=BOOKIE_ID)
+    await call_slash(
+        cog,
+        cog.market_resolve,
+        interaction,
+        bet_id,
+        app_commands.Choice(name="YES", value="yes"),
+    )
+    view = interaction.followup.send.await_args.kwargs["view"]
+    assert isinstance(view, MarketResolveConfirmView)
+
+    button_interaction = make_interaction(user_id=BOOKIE_ID)
+    button_interaction.response.edit_message = AsyncMock()
+    button_interaction.message = MagicMock()
+    button_interaction.message.edit = AsyncMock()
+    cog._get_bet_message = AsyncMock(return_value=None)
+
+    await view.children[0].callback(button_interaction)
+
+    button_interaction.response.edit_message.assert_awaited_once()
+    bet = await db.get_bet(bet_id)
+    assert bet is not None
+    assert bet.status == BetStatus.RESOLVED
+    assert bet.outcome == BetOutcome.YES
+    bot_mock.refresh_bet_message.assert_awaited_once_with(bet_id)
+    bot_mock.untrack_bet.assert_called_once_with(bet_id)
+    assert button_interaction.followup.send.await_count == 1
 
 
 @pytest.mark.asyncio
