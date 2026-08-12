@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 
 import discord
@@ -31,6 +32,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Space board message edits so large chart embeds do not trip channel 429s.
+_BOARD_EDIT_SPACING_SECONDS = 1.25
+
 INTENTS = discord.Intents.default()
 INTENTS.guilds = True
 INTENTS.members = True
@@ -45,6 +49,8 @@ class PropBetBot(commands.Bot):
         self.db = Database()
         self._open_bet_ids: set[int] = set()
         self._wager_prompt_at: dict[tuple[int, int], float] = {}
+        self._board_refresh_locks: dict[int, asyncio.Lock] = {}
+        self._board_refresh_pending: set[int] = set()
         try:
             self._unresolved_refund_after = parse_duration(UNRESOLVED_REFUND_AFTER)
         except DurationParseError as exc:
@@ -149,8 +155,19 @@ class PropBetBot(commands.Bot):
             return fetched
         return None
 
+    def _board_lock_for(self, guild_id: int) -> asyncio.Lock:
+        lock = self._board_refresh_locks.get(guild_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._board_refresh_locks[guild_id] = lock
+        return lock
+
     async def refresh_bet_message(
-        self, bet_id: int, *, footer_extra: str | None = None
+        self,
+        bet_id: int,
+        *,
+        footer_extra: str | None = None,
+        update_board: bool = True,
     ) -> None:
         """Update the public embed for a bet message."""
         bet = await self.db.get_bet(bet_id)
@@ -195,7 +212,7 @@ class PropBetBot(commands.Bot):
         if bet.status == BetStatus.OPEN:
             await ensure_yes_no_reactions(message)
 
-        if bet.bet_kind == BetKind.MARKET:
+        if update_board and bet.bet_kind == BetKind.MARKET:
             await self.refresh_market_board_for_bet(bet_id)
 
     async def refresh_market_board_for_bet(self, bet_id: int) -> None:
@@ -225,10 +242,20 @@ class PropBetBot(commands.Bot):
             )
 
     async def refresh_market_board(self, guild_id: int) -> None:
-        """Post or update market board message(s) for a guild; drop stale pages."""
+        """Post or update market board message(s); coalesce overlapping refreshes."""
         if MARKET_BOARD_CHANNEL_ID is None:
             return
 
+        self._board_refresh_pending.add(guild_id)
+        async with self._board_lock_for(guild_id):
+            if guild_id not in self._board_refresh_pending:
+                return
+            while guild_id in self._board_refresh_pending:
+                self._board_refresh_pending.discard(guild_id)
+                await self._refresh_market_board_unlocked(guild_id)
+
+    async def _refresh_market_board_unlocked(self, guild_id: int) -> None:
+        """Post or update market board message(s) for a guild; drop stale pages."""
         from datetime import datetime, timezone
 
         channel = await self.fetch_channel(MARKET_BOARD_CHANNEL_ID)
@@ -266,6 +293,7 @@ class PropBetBot(commands.Bot):
 
         new_ids: list[int] = []
         for page_index, embed in enumerate(embeds):
+            await asyncio.sleep(_BOARD_EDIT_SPACING_SECONDS)
             message_id = (
                 existing_ids[page_index] if page_index < len(existing_ids) else None
             )
@@ -278,6 +306,7 @@ class PropBetBot(commands.Bot):
             new_ids.append(message.id)
 
         for message_id in existing_ids[len(embeds) :]:
+            await asyncio.sleep(_BOARD_EDIT_SPACING_SECONDS)
             await self._delete_board_message(channel, message_id, guild_id)
 
         await self.db.set_market_board_message_ids(guild_id, new_ids)
@@ -299,15 +328,19 @@ class PropBetBot(commands.Bot):
             return message
         return await channel.send(embed=embed)
 
-    async def _purge_stale_market_board_messages(self) -> None:
+    async def _purge_stale_market_board_messages(
+        self, *, extra_guild_ids: set[int] | None = None
+    ) -> None:
         if MARKET_BOARD_CHANNEL_ID is None:
             return
 
         from datetime import datetime, timezone
 
         purge_before = datetime.now(timezone.utc) - self._market_board_retention
-        guild_ids = await self.db.get_guild_ids_needing_board_refresh(purge_before)
-        for guild_id in guild_ids:
+        guild_ids = set(await self.db.get_guild_ids_needing_board_refresh(purge_before))
+        if extra_guild_ids:
+            guild_ids |= extra_guild_ids
+        for guild_id in sorted(guild_ids):
             await self.refresh_market_board(guild_id)
 
     @tasks.loop(seconds=BET_EXPIRY_CHECK_INTERVAL)
@@ -315,6 +348,7 @@ class PropBetBot(commands.Bot):
         """Close expired open bets and refund stale unresolved closed bets."""
         bet_service = BetService(self.db)
         market_service = MarketService(self.db)
+        board_guild_ids: set[int] = set()
 
         for bet in await self.db.get_expired_open_bets():
             if bet.bet_kind == BetKind.MARKET:
@@ -323,7 +357,9 @@ class PropBetBot(commands.Bot):
                 closed = await bet_service.close_bet(bet.id)
             if closed:
                 logger.info("Closed expired %s #%d", bet.bet_kind.value, bet.id)
-                await self.refresh_bet_message(bet.id)
+                await self.refresh_bet_message(bet.id, update_board=False)
+                if bet.bet_kind == BetKind.MARKET:
+                    board_guild_ids.add(bet.guild_id)
                 self.untrack_bet(bet.id)
 
         for bet in await self.db.get_stale_closed_bets(self._unresolved_refund_after):
@@ -342,10 +378,13 @@ class PropBetBot(commands.Bot):
                 await self.refresh_bet_message(
                     bet.id,
                     footer_extra="Auto-refunded — never resolved",
+                    update_board=False,
                 )
+                if bet.bet_kind == BetKind.MARKET:
+                    board_guild_ids.add(bet.guild_id)
                 self.untrack_bet(bet.id)
 
-        await self._purge_stale_market_board_messages()
+        await self._purge_stale_market_board_messages(extra_guild_ids=board_guild_ids)
 
     @check_expired_bets.before_loop
     async def before_check_expired_bets(self) -> None:

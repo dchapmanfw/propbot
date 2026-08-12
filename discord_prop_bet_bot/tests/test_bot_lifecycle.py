@@ -245,12 +245,16 @@ async def test_check_expired_bets_closes_and_refunds(bot, db):
 
     bot.refresh_bet_message = AsyncMock()
     bot.untrack_bet = MagicMock()
+    bot._purge_stale_market_board_messages = AsyncMock()
 
     await bot.check_expired_bets()
 
     assert (await db.get_bet(expired.id)).status == BetStatus.CLOSED
     assert (await db.get_bet(stale.id)).status == BetStatus.CANCELLED
     assert bot.refresh_bet_message.await_count >= 2
+    for call in bot.refresh_bet_message.await_args_list:
+        assert call.kwargs.get("update_board") is False
+    bot._purge_stale_market_board_messages.assert_awaited_once()
 
 
 @pytest.mark.asyncio
